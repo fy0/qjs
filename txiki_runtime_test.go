@@ -3,15 +3,16 @@ package qjs_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/fastschema/qjs"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
 func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
@@ -36,11 +38,11 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 	result, err := rt.Eval("txiki-core.js", qjs.Code(`
 		export default await (async () => {
 			console.log("hello", { api: "console" });
-			qjs.fs.mkdir("nested", { recursive: true });
-			qjs.fs.writeFile("nested/hello.txt", "world");
-			const text = qjs.fs.readFile("nested/hello.txt", "utf8");
-			const names = qjs.fs.readdir("nested");
-			const stat = qjs.fs.stat("nested/hello.txt");
+			await qjs.fs.mkdir("nested", { recursive: true });
+			await qjs.fs.writeFile("nested/hello.txt", "world");
+			const text = await qjs.fs.readFile("nested/hello.txt", "utf8");
+			const names = await qjs.fs.readdir("nested");
+			const stat = await qjs.fs.stat("nested/hello.txt");
 
 			const random = new Uint8Array(8);
 			crypto.getRandomValues(random);
@@ -89,45 +91,226 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 }
 
 func TestInstallTxikiRuntimeFetch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-		require.Equal(t, http.MethodPost, r.Method)
-		require.Equal(t, "yes", r.Header.Get("X-Test"))
-		w.Header().Set("X-Reply", "ok")
-		_, _ = w.Write([]byte(`{"body":` + string(must(json.Marshal(string(body)))) + `}`))
-	}))
-	defer server.Close()
+	serverURL := startFastHTTPServer(t, func(ctx *fasthttp.RequestCtx) {
+		switch string(ctx.Path()) {
+		case "/echo":
+			ctx.Response.Header.Set("Content-Type", "application/json")
+			ctx.Response.Header.Set("X-Reply", "ok")
+			ctx.Response.Header.Add("X-Multi", "one")
+			ctx.Response.Header.Add("X-Multi", "two")
+			writeJSON(t, ctx, map[string]any{
+				"method": string(ctx.Method()),
+				"xTest":  string(ctx.Request.Header.Peek("X-Test")),
+				"body":   string(ctx.PostBody()),
+				"query":  string(ctx.QueryArgs().Peek("query")),
+			})
+		case "/redirect":
+			ctx.Response.Header.Set("Location", "/final")
+			ctx.SetStatusCode(fasthttp.StatusFound)
+		case "/final":
+			ctx.SetBodyString("redirected")
+		case "/status":
+			ctx.SetStatusCode(fasthttp.StatusTeapot)
+			ctx.SetBodyString("teapot")
+		case "/binary":
+			ctx.Response.Header.Set("Content-Type", "application/octet-stream")
+			ctx.SetBody([]byte{0, 1, 255})
+		case "/request":
+			ctx.Response.Header.Set("Content-Type", "application/json")
+			writeJSON(t, ctx, map[string]any{
+				"method": string(ctx.Method()),
+				"xReq":   string(ctx.Request.Header.Peek("X-Req")),
+				"body":   string(ctx.PostBody()),
+			})
+		default:
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+		}
+	})
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
 	require.NoError(t, rt.InstallTxikiRuntime())
 
-	serverURL := must(json.Marshal(server.URL))
+	serverURLJSON := must(json.Marshal(serverURL))
 	result, err := rt.Eval("txiki-fetch.js", qjs.Code(`
 		export default await (async () => {
-			const res = await fetch(`+string(serverURL)+`, {
+			const headers = new Headers([["X-Test", "yes"]]);
+			headers.append("X-Unused", "drop");
+			headers.delete("X-Unused");
+			const res = await fetch(`+string(serverURLJSON)+` + "/echo?query=1", {
 				method: "POST",
-				headers: { "X-Test": "yes" },
-				body: "ping"
+				headers,
+				body: new Uint8Array([112, 105, 110, 103])
 			});
+			const cloneText = await res.clone().text();
 			const body = await res.json();
-			return {
+			const redirected = await fetch(`+string(serverURLJSON)+` + "/redirect");
+			const errorRes = await fetch(`+string(serverURLJSON)+` + "/status");
+			const binaryRes = await fetch(`+string(serverURLJSON)+` + "/binary");
+			const request = new Request(`+string(serverURLJSON)+` + "/request", {
+				method: "PUT",
+				headers: { "X-Req": "ok" },
+				body: "from request"
+			});
+			const requestRes = await fetch(request);
+			const constructed = new Response("created", { status: 201, headers: { "X-Local": "yes" } });
+			return JSON.stringify({
 				ok: res.ok,
 				status: res.status,
+				statusText: res.statusText,
 				reply: res.headers.get("x-reply"),
-				body: body.body
-			};
+				multi: res.headers.get("x-multi"),
+				cloneText,
+				body,
+				redirectedURL: redirected.url,
+				redirectedText: await redirected.text(),
+				errorOK: errorRes.ok,
+				errorStatus: errorRes.status,
+				errorText: await errorRes.text(),
+				binary: Array.from(new Uint8Array(await binaryRes.arrayBuffer())),
+				request: await requestRes.json(),
+				constructedStatus: constructed.status,
+				constructedOK: constructed.ok,
+				constructedHeader: constructed.headers.get("x-local"),
+				constructedText: await constructed.text()
+			});
 		})();
 	`), qjs.TypeModule())
 	require.NoError(t, err)
 	defer result.Free()
 
-	jsonResult := must(result.JSONStringify())
+	jsonResult := result.String()
 	require.Contains(t, jsonResult, `"ok":true`)
 	require.Contains(t, jsonResult, `"status":200`)
+	require.Contains(t, jsonResult, `"statusText":"OK"`)
 	require.Contains(t, jsonResult, `"reply":"ok"`)
+	require.Contains(t, jsonResult, `"multi":"one, two"`)
+	require.Contains(t, jsonResult, `"method":"POST"`)
+	require.Contains(t, jsonResult, `"xTest":"yes"`)
 	require.Contains(t, jsonResult, `"body":"ping"`)
+	require.Contains(t, jsonResult, `"query":"1"`)
+	require.Contains(t, jsonResult, `"redirectedText":"redirected"`)
+	require.Contains(t, jsonResult, `"errorOK":false`)
+	require.Contains(t, jsonResult, `"errorStatus":418`)
+	require.Contains(t, jsonResult, `"errorText":"teapot"`)
+	require.Contains(t, jsonResult, `"binary":[0,1,255]`)
+	require.Contains(t, jsonResult, `"method":"PUT"`)
+	require.Contains(t, jsonResult, `"xReq":"ok"`)
+	require.Contains(t, jsonResult, `"body":"from request"`)
+	require.Contains(t, jsonResult, `"constructedStatus":201`)
+	require.Contains(t, jsonResult, `"constructedOK":true`)
+	require.Contains(t, jsonResult, `"constructedHeader":"yes"`)
+	require.Contains(t, jsonResult, `"constructedText":"created"`)
+}
+
+func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
+	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
+	defer rt.Close()
+	require.NoError(t, rt.InstallTxikiRuntime())
+
+	result, err := rt.Eval("txiki-fs.js", qjs.Code(`
+		import fsDefault, { promises as fsPromises, readFileSync as importedReadFileSync } from "fs";
+		import { readFile as importedReadFile, writeFile as importedWriteFile, rm as importedRm } from "fs/promises";
+		import nodeFSDefault, { promises as nodeFSPromises } from "node:fs";
+		import { readFile as nodeReadFile } from "node:fs/promises";
+
+		export default await (async () => {
+			const mkdirPromise = qjs.fs.mkdir("dir/sub", { recursive: true });
+			const mkdirIsPromise = !!mkdirPromise && typeof mkdirPromise.then === "function";
+			await mkdirPromise;
+			qjs.fs.writeFileSync("dir/sub/sync.txt", "sync");
+
+			const writePromise = qjs.fs.writeFile("dir/sub/text.txt", "hello");
+			const writeIsPromise = !!writePromise && typeof writePromise.then === "function";
+			await writePromise;
+			await qjs.writeFile("dir/sub/bytes.bin", new Uint8Array([0, 1, 255]));
+			await importedWriteFile("dir/sub/module.txt", "module");
+			const moduleText = await importedReadFile("dir/sub/module.txt", "utf8");
+			const nodeModuleText = await nodeReadFile("dir/sub/module.txt", "utf8");
+			await importedRm("dir/sub/module.txt");
+
+			const readPromise = qjs.fs.readFile("dir/sub/text.txt", { encoding: "utf8" });
+			let readSettled = false;
+			readPromise.then(() => { readSettled = true; });
+			const readInitiallyPending = !readSettled;
+			const text = await readPromise;
+			const text2 = await qjs.fs.readFileText("dir/sub/text.txt");
+			const bytes = Array.from(new Uint8Array(await qjs.readFile("dir/sub/bytes.bin")));
+			const names = await qjs.readDir("dir/sub");
+			const fileStat = await qjs.stat("dir/sub/bytes.bin");
+			const dirStat = qjs.fs.statSync("dir");
+			const existsBefore = await qjs.fs.exists("dir/sub/text.txt");
+			const syncText = qjs.fs.readFileSync("dir/sub/sync.txt", "utf8");
+			const defaultSyncText = fsDefault.readFileSync("dir/sub/sync.txt", "utf8");
+			const importedSyncText = importedReadFileSync("dir/sub/sync.txt", "utf8");
+
+			await qjs.fs.remove("dir/sub/text.txt");
+			const existsAfterFileRemove = await qjs.fs.exists("dir/sub/text.txt");
+
+			let escapeError = "";
+			try {
+				await qjs.fs.writeFile("../escape.txt", "no");
+			} catch (error) {
+				escapeError = String(error);
+			}
+
+			await qjs.remove("dir", { recursive: true });
+			return JSON.stringify({
+				text,
+				text2,
+				moduleText,
+				nodeModuleText,
+				syncText,
+				defaultSyncText,
+				importedSyncText,
+				bytes,
+				names,
+				fileName: fileStat.name,
+				fileSize: fileStat.size,
+				isFile: fileStat.isFile,
+				isDir: dirStat.isDir,
+				existsBefore,
+				existsAfterFileRemove,
+				rootExistsAfterRemove: await qjs.fs.exists("dir"),
+				escapeBlocked: escapeError.includes("escapes runtime CWD"),
+				mkdirIsPromise,
+				writeIsPromise,
+				readInitiallyPending,
+				syncReadIsPromise: typeof syncText?.then === "function",
+				importedPromiseAPI: fsPromises.readFile === qjs.fs.readFile,
+				nodePromiseAPI: nodeFSPromises.readFile === qjs.fs.readFile,
+				nodeDefaultAPI: nodeFSDefault.promises === qjs.fs.promises
+			});
+		})();
+	`), qjs.TypeModule())
+	require.NoError(t, err)
+	defer result.Free()
+
+	jsonResult := result.String()
+	require.Contains(t, jsonResult, `"text":"hello"`)
+	require.Contains(t, jsonResult, `"text2":"hello"`)
+	require.Contains(t, jsonResult, `"moduleText":"module"`)
+	require.Contains(t, jsonResult, `"nodeModuleText":"module"`)
+	require.Contains(t, jsonResult, `"syncText":"sync"`)
+	require.Contains(t, jsonResult, `"defaultSyncText":"sync"`)
+	require.Contains(t, jsonResult, `"importedSyncText":"sync"`)
+	require.Contains(t, jsonResult, `"bytes":[0,1,255]`)
+	require.Contains(t, jsonResult, `"names":["bytes.bin","sync.txt","text.txt"]`)
+	require.Contains(t, jsonResult, `"fileName":"bytes.bin"`)
+	require.Contains(t, jsonResult, `"fileSize":3`)
+	require.Contains(t, jsonResult, `"isFile":true`)
+	require.Contains(t, jsonResult, `"isDir":true`)
+	require.Contains(t, jsonResult, `"existsBefore":true`)
+	require.Contains(t, jsonResult, `"existsAfterFileRemove":false`)
+	require.Contains(t, jsonResult, `"rootExistsAfterRemove":false`)
+	require.Contains(t, jsonResult, `"escapeBlocked":true`)
+	require.Contains(t, jsonResult, `"mkdirIsPromise":true`)
+	require.Contains(t, jsonResult, `"writeIsPromise":true`)
+	require.Contains(t, jsonResult, `"readInitiallyPending":true`)
+	require.Contains(t, jsonResult, `"syncReadIsPromise":false`)
+	require.Contains(t, jsonResult, `"importedPromiseAPI":true`)
+	require.Contains(t, jsonResult, `"nodePromiseAPI":true`)
+	require.Contains(t, jsonResult, `"nodeDefaultAPI":true`)
 }
 
 func TestInstallTxikiRuntimeWebPlatformEvents(t *testing.T) {
@@ -276,10 +459,20 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 	goBinJSON := must(json.Marshal(goBin))
 	result, err := rt.Eval("txiki-process.js", qjs.Code(`
 		export default await (async () => {
-			const result = await process.execFile(`+string(goBinJSON)+`, ["env", "GOVERSION"], { timeout: 10000 });
+			const promise = process.execFile(`+string(goBinJSON)+`, ["env", "GOVERSION"], { timeout: 10000 });
+			const isPromise = !!promise && typeof promise.then === "function";
+			let settled = false;
+			promise.then(() => { settled = true; });
+			const initiallyPending = !settled;
+			const result = await promise;
+			const syncResult = process.execFileSync(`+string(goBinJSON)+`, ["env", "GOVERSION"], { timeout: 10000 });
 			return {
+				isPromise,
+				initiallyPending,
 				success: result.success,
-				stdout: result.stdout.trim()
+				stdout: result.stdout.trim(),
+				syncSuccess: syncResult.success,
+				syncStdout: syncResult.stdout.trim()
 			};
 		})();
 	`), qjs.TypeModule())
@@ -287,8 +480,12 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 	defer result.Free()
 
 	jsonResult := must(result.JSONStringify())
+	require.Contains(t, jsonResult, `"isPromise":true`)
+	require.Contains(t, jsonResult, `"initiallyPending":true`)
 	require.Contains(t, jsonResult, `"success":true`)
 	require.True(t, strings.Contains(jsonResult, `"stdout":"go`), jsonResult)
+	require.Contains(t, jsonResult, `"syncSuccess":true`)
+	require.True(t, strings.Contains(jsonResult, `"syncStdout":"go`), jsonResult)
 }
 
 func TestInstallTxikiRuntimeTCPClient(t *testing.T) {
@@ -441,15 +638,18 @@ func TestInstallTxikiRuntimeHTTPServer(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan string, 1)
 	go func() {
-		client := http.Client{Timeout: 2 * time.Second}
+		client := fasthttp.Client{}
 		url := "http://" + net.JoinHostPort("127.0.0.1", port) + "/hello?x=1"
-		var (
-			resp *http.Response
-			err  error
-		)
+		var err error
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(url)
+		resp := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseResponse(resp)
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			resp, err = client.Get(url)
+			resp.Reset()
+			err = client.DoTimeout(req, resp, 2*time.Second)
 			if err == nil {
 				break
 			}
@@ -459,13 +659,8 @@ func TestInstallTxikiRuntimeHTTPServer(t *testing.T) {
 			done <- "get: " + err.Error()
 			return
 		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			done <- "read: " + err.Error()
-			return
-		}
-		done <- resp.Status + "|" + resp.Header.Get("X-QJS") + "|" + string(body)
+		status := fmt.Sprintf("%d %s", resp.StatusCode(), fasthttp.StatusMessage(resp.StatusCode()))
+		done <- status + "|" + string(resp.Header.Peek("X-QJS")) + "|" + string(resp.Body())
 	}()
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
@@ -646,6 +841,44 @@ func TestInstallTxikiRuntimeWorker(t *testing.T) {
 	require.Contains(t, jsonResult, `{"type":"ready"}`)
 	require.Contains(t, jsonResult, `{"type":"reply","value":42}`)
 	require.Contains(t, jsonResult, `{"type":"listener","value":42}`)
+}
+
+func startFastHTTPServer(t *testing.T, handler fasthttp.RequestHandler) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	server := &fasthttp.Server{Handler: handler}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.ShutdownWithContext(ctx)
+		_ = listener.Close()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("fasthttp server stopped with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("fasthttp server did not stop")
+		}
+	})
+
+	return "http://" + listener.Addr().String()
+}
+
+func writeJSON(t *testing.T, ctx *fasthttp.RequestCtx, value any) {
+	t.Helper()
+
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+	ctx.SetBody(data)
 }
 
 func freeTCPPort(t *testing.T) string {

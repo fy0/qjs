@@ -17,14 +17,17 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 const webSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 type txikiHTTPServer struct {
 	id       int64
-	server   *http.Server
+	server   *fasthttp.Server
 	listener net.Listener
 	requests chan *txikiHTTPRequest
 }
@@ -35,17 +38,16 @@ type txikiHTTPRequest struct {
 	method   string
 	url      string
 	path     string
-	headers  http.Header
+	headers  map[string][]string
 	body     []byte
 	ws       bool
-	writer   http.ResponseWriter
-	request  *http.Request
+	ctx      *fasthttp.RequestCtx
 	response chan txikiHTTPResponse
 }
 
 type txikiHTTPResponse struct {
 	status        int
-	headers       http.Header
+	headers       map[string][]string
 	body          []byte
 	upgrade       bool
 	upgradeResult chan txikiHTTPUpgradeResult
@@ -61,6 +63,10 @@ type txikiWebSocketConn struct {
 	conn     net.Conn
 	isClient bool
 	mu       syncMutex
+	ready    chan struct{}
+	done     chan struct{}
+	err      error
+	once     sync.Once
 }
 
 type syncMutex struct {
@@ -69,6 +75,50 @@ type syncMutex struct {
 
 func newSyncMutex() syncMutex {
 	return syncMutex{ch: make(chan struct{}, 1)}
+}
+
+func newTxikiWebSocketConn(conn net.Conn, isClient bool) *txikiWebSocketConn {
+	ws := &txikiWebSocketConn{
+		conn:     conn,
+		isClient: isClient,
+		mu:       newSyncMutex(),
+		ready:    make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	if conn != nil {
+		close(ws.ready)
+	}
+
+	return ws
+}
+
+func (ws *txikiWebSocketConn) setConn(conn net.Conn) {
+	ws.conn = conn
+	close(ws.ready)
+}
+
+func (ws *txikiWebSocketConn) fail(err error) {
+	ws.err = err
+	close(ws.ready)
+	ws.closeDone()
+}
+
+func (ws *txikiWebSocketConn) waitConn() (net.Conn, error) {
+	<-ws.ready
+	if ws.err != nil {
+		return nil, ws.err
+	}
+	if ws.conn == nil {
+		return nil, net.ErrClosed
+	}
+
+	return ws.conn, nil
+}
+
+func (ws *txikiWebSocketConn) closeDone() {
+	ws.once.Do(func() {
+		close(ws.done)
+	})
 }
 
 func (m syncMutex) lock() {
@@ -195,16 +245,16 @@ func (s *txikiRuntimeState) httpListen(this *This) (*Value, error) {
 		listener: listener,
 		requests: make(chan *txikiHTTPRequest),
 	}
-	server.server = &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			server.handle(s, w, r)
-		}),
+	server.server = &fasthttp.Server{
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			server.handle(s, ctx)
+		},
 	}
 
 	id := s.net.addHTTPServer(server)
 	go func() {
 		err := server.server.Serve(listener)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
 			_ = err
 		}
 	}()
@@ -319,30 +369,29 @@ func (s *txikiRuntimeState) httpClose(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (server *txikiHTTPServer) handle(state *txikiRuntimeState, w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
+func (server *txikiHTTPServer) handle(state *txikiRuntimeState, ctx *fasthttp.RequestCtx) {
+	body := append([]byte(nil), ctx.PostBody()...)
+	headers := map[string][]string{}
+	ctx.Request.Header.VisitAll(func(key, value []byte) {
+		name := string(key)
+		headers[name] = append(headers[name], string(value))
+	})
 	request := &txikiHTTPRequest{
 		serverID: server.id,
-		method:   r.Method,
-		url:      r.URL.String(),
-		path:     r.URL.Path,
-		headers:  r.Header.Clone(),
+		method:   string(ctx.Method()),
+		url:      ctx.URI().String(),
+		path:     string(ctx.Path()),
+		headers:  headers,
 		body:     body,
-		ws:       isWebSocketRequest(r),
-		writer:   w,
-		request:  r,
+		ws:       isWebSocketRequest(ctx),
+		ctx:      ctx,
 		response: make(chan txikiHTTPResponse, 1),
 	}
 	state.net.addHTTPRequest(request)
 
 	select {
 	case server.requests <- request:
-	case <-r.Context().Done():
+	case <-ctx.Done():
 		state.net.takeHTTPRequestIgnore(request.id)
 		return
 	}
@@ -355,15 +404,15 @@ func (server *txikiHTTPServer) handle(state *txikiRuntimeState, w http.ResponseW
 	}
 
 	if response.status == 0 {
-		response.status = http.StatusOK
+		response.status = fasthttp.StatusOK
 	}
 	for name, values := range response.headers {
 		for _, value := range values {
-			w.Header().Add(name, value)
+			ctx.Response.Header.Add(name, value)
 		}
 	}
-	w.WriteHeader(response.status)
-	_, _ = w.Write(response.body)
+	ctx.SetStatusCode(response.status)
+	ctx.SetBody(response.body)
 }
 
 func (n *txikiNetState) takeHTTPRequestIgnore(id int64) {
@@ -375,13 +424,13 @@ func (n *txikiNetState) takeHTTPRequestIgnore(id int64) {
 func (server *txikiHTTPServer) close() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_ = server.server.Shutdown(ctx)
+	_ = server.server.ShutdownWithContext(ctx)
 	_ = server.listener.Close()
 	close(server.requests)
 }
 
-func parseHTTPHeaders(raw string) (http.Header, error) {
-	headers := http.Header{}
+func parseHTTPHeaders(raw string) (map[string][]string, error) {
+	headers := map[string][]string{}
 	if strings.TrimSpace(raw) == "" {
 		return headers, nil
 	}
@@ -393,17 +442,17 @@ func parseHTTPHeaders(raw string) (http.Header, error) {
 
 	for name, list := range values {
 		for _, value := range list {
-			headers.Add(name, value)
+			headers[name] = append(headers[name], value)
 		}
 	}
 
 	return headers, nil
 }
 
-func isWebSocketRequest(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") &&
-		r.Header.Get("Sec-WebSocket-Key") != ""
+func isWebSocketRequest(ctx *fasthttp.RequestCtx) bool {
+	return strings.EqualFold(string(ctx.Request.Header.Peek("Upgrade")), "websocket") &&
+		strings.Contains(strings.ToLower(string(ctx.Request.Header.Peek("Connection"))), "upgrade") &&
+		len(ctx.Request.Header.Peek("Sec-WebSocket-Key")) > 0
 }
 
 func (s *txikiRuntimeState) upgradeHTTPRequest(request *txikiHTTPRequest) (map[string]any, error) {
@@ -411,32 +460,23 @@ func (s *txikiRuntimeState) upgradeHTTPRequest(request *txikiHTTPRequest) (map[s
 		return nil, errors.New("request is not a websocket upgrade")
 	}
 
-	hijacker, ok := request.writer.(http.Hijacker)
-	if !ok {
-		return nil, errors.New("http response writer does not support hijacking")
-	}
-
-	conn, rw, err := hijacker.Hijack()
-	if err != nil {
-		return nil, err
-	}
-
-	accept := computeWebSocketAccept(request.request.Header.Get("Sec-WebSocket-Key"))
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-	if _, err := rw.WriteString(response); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if err := rw.Flush(); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
-	ws := &txikiWebSocketConn{conn: conn, mu: newSyncMutex()}
+	accept := computeWebSocketAccept(string(request.ctx.Request.Header.Peek("Sec-WebSocket-Key")))
+	ws := newTxikiWebSocketConn(nil, false)
 	id := s.net.addWebSocket(ws)
+	request.ctx.HijackSetNoResponse(true)
+	request.ctx.Hijack(func(conn net.Conn) {
+		response := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		if _, err := io.WriteString(conn, response); err != nil {
+			ws.fail(err)
+			_ = conn.Close()
+			return
+		}
+		ws.setConn(conn)
+		<-ws.done
+	})
 
 	return map[string]any{
 		"id":   id,
@@ -511,7 +551,7 @@ func (s *txikiRuntimeState) wsConnect(this *This) (*Value, error) {
 		return nil, errors.New("websocket upgrade returned invalid accept key")
 	}
 
-	ws := &txikiWebSocketConn{conn: conn, isClient: true, mu: newSyncMutex()}
+	ws := newTxikiWebSocketConn(conn, true)
 	id := s.net.addWebSocket(ws)
 
 	return ToJsValue(this.Context(), map[string]any{
@@ -607,8 +647,13 @@ func (ws *txikiWebSocketConn) readMessage() (byte, []byte, error) {
 }
 
 func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
+	conn, err := ws.waitConn()
+	if err != nil {
+		return 0, nil, err
+	}
+
 	header := make([]byte, 2)
-	if _, err := io.ReadFull(ws.conn, header); err != nil {
+	if _, err := io.ReadFull(conn, header); err != nil {
 		return 0, nil, err
 	}
 
@@ -619,13 +664,13 @@ func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
 	switch length {
 	case 126:
 		var ext [2]byte
-		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
 			return 0, nil, err
 		}
 		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
-		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
+		if _, err := io.ReadFull(conn, ext[:]); err != nil {
 			return 0, nil, err
 		}
 		length = binary.BigEndian.Uint64(ext[:])
@@ -633,7 +678,7 @@ func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
 
 	var mask [4]byte
 	if masked {
-		if _, err := io.ReadFull(ws.conn, mask[:]); err != nil {
+		if _, err := io.ReadFull(conn, mask[:]); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -643,7 +688,7 @@ func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
 	}
 
 	payload := make([]byte, length)
-	if _, err := io.ReadFull(ws.conn, payload); err != nil {
+	if _, err := io.ReadFull(conn, payload); err != nil {
 		return 0, nil, err
 	}
 
@@ -657,6 +702,11 @@ func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
 }
 
 func (ws *txikiWebSocketConn) writeFrame(opcode byte, payload []byte) error {
+	conn, err := ws.waitConn()
+	if err != nil {
+		return err
+	}
+
 	ws.mu.lock()
 	defer ws.mu.unlock()
 
@@ -695,15 +745,28 @@ func (ws *txikiWebSocketConn) writeFrame(opcode byte, payload []byte) error {
 		}
 	}
 
-	if _, err := ws.conn.Write(header.Bytes()); err != nil {
+	if _, err := conn.Write(header.Bytes()); err != nil {
 		return err
 	}
-	_, err := ws.conn.Write(out)
+	_, err = conn.Write(out)
 
 	return err
 }
 
 func (ws *txikiWebSocketConn) close() error {
+	if ws == nil {
+		return nil
+	}
+
+	conn, err := ws.waitConn()
+	if err != nil {
+		ws.closeDone()
+		return err
+	}
+
 	_ = ws.writeFrame(8, nil)
-	return ws.conn.Close()
+	closeErr := conn.Close()
+	ws.closeDone()
+
+	return closeErr
 }

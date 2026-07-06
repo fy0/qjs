@@ -287,11 +287,11 @@ if err := rt.InstallTxikiRuntime(); err != nil {
 result, err := rt.Eval("app.js", qjs.Code(`
 	export default await (async () => {
 		console.log("runtime ready");
-		qjs.fs.writeFile("hello.txt", "hello");
+		await qjs.writeFile("hello.txt", "hello");
 		const res = await fetch("https://example.com");
 		const digest = await crypto.subtle.digest("SHA-256", new Uint8Array([1, 2, 3]));
 		return {
-			file: qjs.fs.readFile("hello.txt", "utf8"),
+			file: await qjs.readFile("hello.txt", "utf8"),
 			status: res.status,
 			digestBytes: digest.byteLength,
 		};
@@ -303,7 +303,22 @@ if err != nil {
 defer result.Free()
 ```
 
-The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, `process.execFile`, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`.
+The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, importable `fs`, `node:fs`, `fs/promises`, and `node:fs/promises` modules, `process.execFile`, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`. The `fetch` client and `qjs.http.serve()` server are backed by `github.com/valyala/fasthttp`; pass `TxikiRuntimeOptions.FetchClient` to customize the `*fasthttp.Client`.
+
+Filesystem APIs follow the txiki.js-style Promise shape through `qjs.readFile`, `qjs.writeFile`, `qjs.makeDir`, `qjs.readDir`, `qjs.stat`, `qjs.remove`, and matching `qjs.fs` methods. The same API is importable from `fs/promises` and `node:fs/promises`, and is also exposed as `fs.promises` from `fs` / `node:fs`. Explicit synchronous variants are available as `qjs.fs.readFileSync`, `qjs.fs.writeFileSync`, `qjs.fs.mkdirSync`, `qjs.fs.readdirSync`, `qjs.fs.statSync`, `qjs.fs.existsSync`, `qjs.fs.removeSync`, and matching named exports from `fs`.
+
+```js
+import fs, { promises as fsp, readFileSync } from "node:fs";
+import { readFile, writeFile, rm } from "node:fs/promises";
+
+await writeFile("hello.txt", "hello");
+console.log(await readFile("hello.txt", "utf8"));
+console.log(readFileSync("hello.txt", "utf8"));
+console.log(await fsp.stat("hello.txt"));
+await rm("hello.txt");
+```
+
+`process.execFile()` also runs asynchronously and resolves with `{ exitCode, success, stdout, stderr }`. Use `process.execFileSync()` when a blocking child-process call is intended.
 
 ```go
 result, err := rt.Eval("net.js", qjs.Code(`

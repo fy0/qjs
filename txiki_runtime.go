@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 const maxCryptoRandomValues = 65536
@@ -32,14 +34,14 @@ type TxikiRuntimeOptions struct {
 	CWD         string
 	Stdout      io.Writer
 	Stderr      io.Writer
-	FetchClient *http.Client
+	FetchClient *fasthttp.Client
 }
 
 type txikiRuntimeConfig struct {
 	cwd         string
 	stdout      io.Writer
 	stderr      io.Writer
-	fetchClient *http.Client
+	fetchClient *fasthttp.Client
 }
 
 type txikiRuntimeState struct {
@@ -47,10 +49,20 @@ type txikiRuntimeState struct {
 	net     *txikiNetState
 	workers *txikiWorkerManager
 
-	nextSignalID int64
-	signalsMu    sync.Mutex
-	signals      map[int64]*txikiSignal
-	signalEvents []txikiSignalEvent
+	asyncMu       sync.Mutex
+	nextAsyncID   int64
+	asyncFSJobs   map[int64]*txikiAsyncJob
+	asyncProcJobs map[int64]*txikiAsyncJob
+	nextSignalID  int64
+	signalsMu     sync.Mutex
+	signals       map[int64]*txikiSignal
+	signalEvents  []txikiSignalEvent
+}
+
+type txikiAsyncJob struct {
+	done   bool
+	result any
+	err    error
 }
 
 type txikiSignal struct {
@@ -107,10 +119,12 @@ func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
 
 	config := c.newTxikiRuntimeConfig(options...)
 	state := &txikiRuntimeState{
-		config:  config,
-		net:     newTxikiNetState(),
-		workers: newTxikiWorkerManager(),
-		signals: make(map[int64]*txikiSignal),
+		config:        config,
+		net:           newTxikiNetState(),
+		workers:       newTxikiWorkerManager(),
+		signals:       make(map[int64]*txikiSignal),
+		asyncFSJobs:   make(map[int64]*txikiAsyncJob),
+		asyncProcJobs: make(map[int64]*txikiAsyncJob),
 	}
 
 	c.runtime.addCleanup(state.close)
@@ -120,8 +134,32 @@ func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
 	if result != nil {
 		result.Free()
 	}
+	if err != nil {
+		return err
+	}
 
-	return err
+	return c.installTxikiRuntimeModules()
+}
+
+func (c *Context) installTxikiRuntimeModules() error {
+	modules := map[string]string{
+		"fs":               txikiFSModuleScript,
+		"node:fs":          txikiFSModuleScript,
+		"fs/promises":      txikiFSPromisesModuleScript,
+		"node:fs/promises": txikiFSPromisesModuleScript,
+	}
+
+	for name, source := range modules {
+		result, err := c.Load(name, Code(source))
+		if result != nil {
+			result.Free()
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) txikiRuntimeConfig {
@@ -143,7 +181,7 @@ func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) txikiRun
 	}
 
 	if option.FetchClient == nil {
-		option.FetchClient = http.DefaultClient
+		option.FetchClient = &fasthttp.Client{}
 	}
 
 	return txikiRuntimeConfig{
@@ -172,8 +210,12 @@ func (s *txikiRuntimeState) installHostFunctions(c *Context) {
 	c.SetFunc("__qjs_fs_stat", s.fsStat)
 	c.SetFunc("__qjs_fs_exists", s.fsExists)
 	c.SetFunc("__qjs_fs_remove", s.fsRemove)
+	c.SetFunc("__qjs_fs_async_start", s.fsAsyncStart)
+	c.SetFunc("__qjs_fs_async_poll", s.fsAsyncPoll)
 	c.SetFunc("__qjs_process_env_json", s.processEnvJSON)
 	c.SetFunc("__qjs_exec_file", s.execFile)
+	c.SetFunc("__qjs_exec_file_async_start", s.execFileAsyncStart)
+	c.SetFunc("__qjs_exec_file_async_poll", s.execFileAsyncPoll)
 	c.SetFunc("__qjs_signal_on", s.signalOn)
 	c.SetFunc("__qjs_signal_off", s.signalOff)
 	c.SetFunc("__qjs_signal_poll", s.signalPoll)
@@ -327,7 +369,7 @@ func (s *txikiRuntimeState) newFetchRequest(this *This) (fetchRequest, error) {
 	url := args[0].String()
 	method := strings.TrimSpace(args[1].String())
 	if method == "" {
-		method = http.MethodGet
+		method = fasthttp.MethodGet
 	}
 
 	var bodyBytes []byte
@@ -350,40 +392,100 @@ func (s *txikiRuntimeState) newFetchRequest(this *This) (fetchRequest, error) {
 }
 
 func (s *txikiRuntimeState) doFetch(ctx context.Context, request fetchRequest) (fetchPayload, error) {
-	var body io.Reader
-	if request.body != nil {
-		body = bytes.NewReader(request.body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, request.method, request.url, body)
+	currentURL, err := url.Parse(request.url)
 	if err != nil {
 		return fetchPayload{}, err
 	}
 
-	for name, values := range request.headers {
-		for _, value := range values {
-			req.Header.Add(name, value)
+	method := request.method
+	body := request.body
+	client := s.config.fetchClient
+	if client == nil {
+		client = &fasthttp.Client{}
+	}
+
+	for redirects := 0; redirects <= 20; redirects++ {
+		if err := ctx.Err(); err != nil {
+			return fetchPayload{}, err
 		}
+
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+		req.SetRequestURI(currentURL.String())
+		req.Header.SetMethod(method)
+		for name, values := range request.headers {
+			for _, value := range values {
+				req.Header.Add(name, value)
+			}
+		}
+		if body != nil {
+			req.SetBody(body)
+		}
+
+		err := client.Do(req, resp)
+		fasthttp.ReleaseRequest(req)
+		if err != nil {
+			fasthttp.ReleaseResponse(resp)
+			return fetchPayload{}, err
+		}
+
+		status := resp.StatusCode()
+		location := string(resp.Header.Peek("Location"))
+		if isFetchRedirectStatus(status) && location != "" {
+			nextURL, err := currentURL.Parse(location)
+			fasthttp.ReleaseResponse(resp)
+			if err != nil {
+				return fetchPayload{}, err
+			}
+			if shouldFetchRedirectSwitchToGet(status, method) {
+				method = fasthttp.MethodGet
+				body = nil
+			}
+			currentURL = nextURL
+
+			continue
+		}
+
+		responseBody := append([]byte(nil), resp.Body()...)
+		headers := map[string][]string{}
+		resp.Header.VisitAll(func(key, value []byte) {
+			name := string(key)
+			headers[name] = append(headers[name], string(value))
+		})
+		payload := fetchPayload{
+			URL:        currentURL.String(),
+			Status:     status,
+			StatusText: fasthttp.StatusMessage(status),
+			Headers:    headers,
+			Body:       responseBody,
+		}
+		fasthttp.ReleaseResponse(resp)
+
+		return payload, nil
 	}
 
-	resp, err := s.config.fetchClient.Do(req)
-	if err != nil {
-		return fetchPayload{}, err
-	}
-	defer resp.Body.Close()
+	return fetchPayload{}, errors.New("fetch stopped after too many redirects")
+}
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fetchPayload{}, err
+func isFetchRedirectStatus(status int) bool {
+	switch status {
+	case fasthttp.StatusMovedPermanently,
+		fasthttp.StatusFound,
+		fasthttp.StatusSeeOther,
+		fasthttp.StatusTemporaryRedirect,
+		fasthttp.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldFetchRedirectSwitchToGet(status int, method string) bool {
+	if status == fasthttp.StatusSeeOther {
+		return method != fasthttp.MethodGet && method != fasthttp.MethodHead
 	}
 
-	return fetchPayload{
-		URL:        resp.Request.URL.String(),
-		Status:     resp.StatusCode,
-		StatusText: http.StatusText(resp.StatusCode),
-		Headers:    map[string][]string(resp.Header),
-		Body:       responseBody,
-	}, nil
+	return (status == fasthttp.StatusMovedPermanently || status == fasthttp.StatusFound) && method == fasthttp.MethodPost
 }
 
 func (s *txikiRuntimeState) fsReadFile(this *This) (*Value, error) {
@@ -492,16 +594,7 @@ func (s *txikiRuntimeState) fsStat(this *This) (*Value, error) {
 		return nil, err
 	}
 
-	stat := map[string]any{
-		"name":    info.Name(),
-		"size":    info.Size(),
-		"mode":    info.Mode().String(),
-		"modTime": info.ModTime(),
-		"isFile":  !info.IsDir(),
-		"isDir":   info.IsDir(),
-	}
-
-	return ToJsValue(this.Context(), stat)
+	return ToJsValue(this.Context(), fileInfoToStat(info))
 }
 
 func (s *txikiRuntimeState) fsExists(this *This) (*Value, error) {
@@ -544,6 +637,160 @@ func (s *txikiRuntimeState) fsRemove(this *This) (*Value, error) {
 	}
 
 	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) fsAsyncStart(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) < 4 {
+		return nil, errors.New("async fs start requires operation, path, encoding, and recursive")
+	}
+
+	op := args[0].String()
+	path, err := s.resolvePath(args[1].String())
+	if err != nil {
+		return nil, err
+	}
+	encoding := strings.ToLower(strings.TrimSpace(args[2].String()))
+	recursive := args[3].Bool()
+
+	var data []byte
+	if len(args) > 4 && !args[4].IsNull() && !args[4].IsUndefined() {
+		data, err = jsValueToBytes(args[4])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	id := s.addAsyncFSJob()
+	go func() {
+		result, err := s.runAsyncFSOperation(op, path, encoding, recursive, data)
+		s.completeAsyncFSJob(id, result, err)
+	}()
+
+	return this.Context().NewInt64(id), nil
+}
+
+func (s *txikiRuntimeState) fsAsyncPoll(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("async fs poll requires a job id")
+	}
+
+	id := args[0].Int64()
+	s.asyncMu.Lock()
+	job, ok := s.asyncFSJobs[id]
+	if !ok {
+		s.asyncMu.Unlock()
+		return nil, fmt.Errorf("async fs job %d does not exist", id)
+	}
+	if !job.done {
+		s.asyncMu.Unlock()
+		return ToJsValue(this.Context(), map[string]any{"done": false})
+	}
+	delete(s.asyncFSJobs, id)
+	s.asyncMu.Unlock()
+
+	payload := map[string]any{"done": true}
+	if job.err != nil {
+		payload["error"] = job.err.Error()
+	} else {
+		payload["result"] = job.result
+	}
+
+	return ToJsValue(this.Context(), payload)
+}
+
+func (s *txikiRuntimeState) addAsyncFSJob() int64 {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	s.nextAsyncID++
+	id := s.nextAsyncID
+	s.asyncFSJobs[id] = &txikiAsyncJob{}
+
+	return id
+}
+
+func (s *txikiRuntimeState) completeAsyncFSJob(id int64, result any, err error) {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	if job := s.asyncFSJobs[id]; job != nil {
+		job.done = true
+		job.result = result
+		job.err = err
+	}
+}
+
+func (s *txikiRuntimeState) runAsyncFSOperation(op, path, encoding string, recursive bool, data []byte) (any, error) {
+	switch op {
+	case "readFile":
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if encoding != "" {
+			return string(content), nil
+		}
+
+		return content, nil
+	case "writeFile":
+		return nil, os.WriteFile(path, data, 0o644)
+	case "mkdir":
+		if recursive {
+			return nil, os.MkdirAll(path, 0o755)
+		}
+
+		return nil, os.Mkdir(path, 0o755)
+	case "readdir":
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		sort.Strings(names)
+
+		return names, nil
+	case "stat":
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+
+		return fileInfoToStat(info), nil
+	case "exists":
+		_, err := os.Stat(path)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+
+		return nil, err
+	case "remove":
+		if recursive {
+			return nil, os.RemoveAll(path)
+		}
+
+		return nil, os.Remove(path)
+	default:
+		return nil, fmt.Errorf("unsupported async fs operation %q", op)
+	}
+}
+
+func fileInfoToStat(info os.FileInfo) map[string]any {
+	return map[string]any{
+		"name":    info.Name(),
+		"size":    info.Size(),
+		"mode":    info.Mode().String(),
+		"modTime": info.ModTime(),
+		"isFile":  !info.IsDir(),
+		"isDir":   info.IsDir(),
+	}
 }
 
 func (s *txikiRuntimeState) pathArg(this *This) (string, error) {
@@ -619,6 +866,73 @@ func (s *txikiRuntimeState) execFile(this *This) (*Value, error) {
 	}
 
 	return ToJsValue(this.Context(), result)
+}
+
+func (s *txikiRuntimeState) execFileAsyncStart(this *This) (*Value, error) {
+	request, err := s.newExecFileRequest(this)
+	if err != nil {
+		return nil, err
+	}
+
+	id := s.addAsyncProcessJob()
+	go func() {
+		result, err := s.doExecFile(request)
+		s.completeAsyncProcessJob(id, result, err)
+	}()
+
+	return this.Context().NewInt64(id), nil
+}
+
+func (s *txikiRuntimeState) execFileAsyncPoll(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("async execFile poll requires a job id")
+	}
+
+	id := args[0].Int64()
+	s.asyncMu.Lock()
+	job, ok := s.asyncProcJobs[id]
+	if !ok {
+		s.asyncMu.Unlock()
+		return nil, fmt.Errorf("async execFile job %d does not exist", id)
+	}
+	if !job.done {
+		s.asyncMu.Unlock()
+		return ToJsValue(this.Context(), map[string]any{"done": false})
+	}
+	delete(s.asyncProcJobs, id)
+	s.asyncMu.Unlock()
+
+	payload := map[string]any{"done": true}
+	if job.err != nil {
+		payload["error"] = job.err.Error()
+	} else {
+		payload["result"] = job.result
+	}
+
+	return ToJsValue(this.Context(), payload)
+}
+
+func (s *txikiRuntimeState) addAsyncProcessJob() int64 {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	s.nextAsyncID++
+	id := s.nextAsyncID
+	s.asyncProcJobs[id] = &txikiAsyncJob{}
+
+	return id
+}
+
+func (s *txikiRuntimeState) completeAsyncProcessJob(id int64, result any, err error) {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	if job := s.asyncProcJobs[id]; job != nil {
+		job.done = true
+		job.result = result
+		job.err = err
+	}
 }
 
 func (s *txikiRuntimeState) newExecFileRequest(this *This) (execFileRequest, error) {
@@ -1604,8 +1918,48 @@ const txikiRuntimeScript = `
     return new Headers(headers).toObject();
   }
 
+  class Request {
+    constructor(input, init = {}) {
+      const source = input instanceof Request ? input : null;
+      this.url = String(source ? source.url : input && input.url ? input.url : input);
+      if (!this.url || this.url === "undefined") throw new TypeError("Request requires a URL");
+      this.method = String(init.method || (source && source.method) || "GET").toUpperCase();
+      this.headers = new Headers(init.headers || (source && source.headers) || {});
+      this.signal = init.signal || (source && source.signal) || null;
+      const hasInitBody = Object.prototype.hasOwnProperty.call(init, "body");
+      this._body = hasInitBody ? toArrayBuffer(init.body) : source && source._body ? source._body.slice(0) : null;
+      this.bodyUsed = false;
+    }
+    arrayBuffer() {
+      this.bodyUsed = true;
+      return Promise.resolve((this._body || new ArrayBuffer(0)).slice(0));
+    }
+    text() {
+      return this.arrayBuffer().then(decodeBytes);
+    }
+    json() {
+      return this.text().then(JSON.parse);
+    }
+    clone() {
+      return new Request(this);
+    }
+  }
+  define(globalThis, "Request", Request);
+
   class Response {
-    constructor(payload) {
+    constructor(bodyOrPayload = null, init = undefined) {
+      const hostPayload = init === undefined &&
+        bodyOrPayload &&
+        typeof bodyOrPayload === "object" &&
+        Object.prototype.hasOwnProperty.call(bodyOrPayload, "status") &&
+        Object.prototype.hasOwnProperty.call(bodyOrPayload, "body");
+      const payload = hostPayload ? bodyOrPayload : {
+        url: "",
+        status: init && init.status !== undefined ? init.status : 200,
+        statusText: init && init.statusText !== undefined ? init.statusText : "",
+        headers: init && init.headers ? init.headers : {},
+        body: toArrayBuffer(bodyOrPayload) || new ArrayBuffer(0)
+      };
       this.url = payload.url || "";
       this.status = payload.status || 0;
       this.statusText = payload.statusText || "";
@@ -1638,28 +1992,90 @@ const txikiRuntimeScript = `
   define(globalThis, "Response", Response);
 
   define(globalThis, "fetch", function fetch(input, init = {}) {
-    const url = typeof input === "string" ? input : input && input.url;
-    if (!url) return Promise.reject(new TypeError("fetch requires a URL"));
-    if (init.signal && init.signal.aborted) return Promise.reject(init.signal.reason || new DOMException("This operation was aborted", "AbortError"));
-    const method = String(init.method || "GET").toUpperCase();
-    const headers = headersToObject(init.headers || {});
-    const body = toArrayBuffer(init.body);
-    return Promise.resolve(__qjs_fetch(String(url), method, JSON.stringify(headers), body)).then(payload => new Response(payload));
+    let request;
+    try {
+      request = input instanceof Request && Object.keys(init || {}).length === 0 ? input : new Request(input, init);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (request.signal && request.signal.aborted) return Promise.reject(request.signal.reason || new DOMException("This operation was aborted", "AbortError"));
+    return Promise.resolve(__qjs_fetch(request.url, request.method, JSON.stringify(headersToObject(request.headers)), request._body)).then(payload => new Response(payload));
   });
 
+  function fsAsync(op, path, options, data) {
+    const encoding = typeof options === "string" ? options : options && options.encoding ? options.encoding : "";
+    const recursive = !!(options && typeof options === "object" && options.recursive);
+    return new Promise((resolve, reject) => {
+      let id;
+      try {
+        id = __qjs_fs_async_start(String(op), String(path), String(encoding || ""), recursive, data === undefined ? null : data);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const poll = () => {
+        let payload;
+        try {
+          payload = __qjs_fs_async_poll(id);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        if (!payload.done) {
+          setTimeout(poll, 1);
+          return;
+        }
+        if (payload.error) reject(new Error(payload.error));
+        else resolve(payload.result);
+      };
+      setTimeout(poll, 0);
+    });
+  }
+
   const fs = qjs.fs || {};
-  fs.readFile = function readFile(path, options) {
+  fs.readFileSync = function readFileSync(path, options) {
     const encoding = typeof options === "string" ? options : options && options.encoding;
     return encoding ? __qjs_fs_read_text(String(path), String(encoding)) : __qjs_fs_read_file(String(path));
   };
-  fs.readFileText = path => __qjs_fs_read_text(String(path), "utf8");
-  fs.writeFile = (path, data) => __qjs_fs_write_file(String(path), data);
-  fs.mkdir = (path, options = {}) => __qjs_fs_mkdir(String(path), !!options.recursive);
-  fs.readdir = path => __qjs_fs_readdir(String(path || "."));
-  fs.stat = path => __qjs_fs_stat(String(path));
-  fs.exists = path => __qjs_fs_exists(String(path));
-  fs.remove = (path, options = {}) => __qjs_fs_remove(String(path), !!options.recursive);
+  fs.readFileTextSync = path => __qjs_fs_read_text(String(path), "utf8");
+  fs.writeFileSync = (path, data) => __qjs_fs_write_file(String(path), data);
+  fs.mkdirSync = (path, options = {}) => __qjs_fs_mkdir(String(path), !!options.recursive);
+  fs.readdirSync = path => __qjs_fs_readdir(String(path || "."));
+  fs.statSync = path => __qjs_fs_stat(String(path));
+  fs.existsSync = path => __qjs_fs_exists(String(path));
+  fs.removeSync = (path, options = {}) => __qjs_fs_remove(String(path), !!options.recursive);
+  fs.readFile = (path, options) => fsAsync("readFile", path, options);
+  fs.readFileText = path => fsAsync("readFile", path, "utf8");
+  fs.writeFile = (path, data, options = {}) => fsAsync("writeFile", path, options, data);
+  fs.mkdir = (path, options = {}) => fsAsync("mkdir", path, options);
+  fs.readdir = path => fsAsync("readdir", path || ".", {});
+  fs.stat = path => fsAsync("stat", path, {});
+  fs.exists = path => fsAsync("exists", path, {});
+  fs.remove = (path, options = {}) => fsAsync("remove", path, options);
+  fs.rm = fs.remove;
+  fs.rmSync = fs.removeSync;
+  fs.readDir = fs.readdir;
+  fs.makeDir = fs.mkdir;
+  const fsPromises = fs.promises || {};
+  fsPromises.readFile = fs.readFile;
+  fsPromises.readFileText = fs.readFileText;
+  fsPromises.writeFile = fs.writeFile;
+  fsPromises.mkdir = fs.mkdir;
+  fsPromises.readdir = fs.readdir;
+  fsPromises.readDir = fs.readdir;
+  fsPromises.stat = fs.stat;
+  fsPromises.exists = fs.exists;
+  fsPromises.remove = fs.remove;
+  fsPromises.rm = fs.remove;
+  define(fs, "promises", fsPromises, true);
   define(qjs, "fs", fs, true);
+  define(qjs, "readFile", fs.readFile, true);
+  define(qjs, "writeFile", fs.writeFile, true);
+  define(qjs, "makeDir", fs.mkdir, true);
+  define(qjs, "readDir", fs.readdir, true);
+  define(qjs, "stat", fs.stat, true);
+  define(qjs, "remove", fs.remove, true);
+  if (typeof globalThis.tjs === "undefined") define(globalThis, "tjs", qjs);
 
   class TCPSocket {
     constructor(remoteAddress, remotePort, options = {}, acceptedInfo) {
@@ -1985,16 +2401,46 @@ const txikiRuntimeScript = `
   processObj.arch = "` + goruntime.GOARCH + `";
   processObj.cwd = () => ".";
   processObj.env = JSON.parse(__qjs_process_env_json());
-  processObj.execFile = function execFile(file, args = [], options = {}) {
+  function execFileArgs(file, args = [], options = {}) {
     const input = options.input == null ? null : toArrayBuffer(options.input);
-    return Promise.resolve(__qjs_exec_file(
+    return [
       String(file),
       JSON.stringify(args.map(String)),
       options.cwd ? String(options.cwd) : "",
       JSON.stringify(options.env || {}),
       input,
       Number(options.timeout || 0)
-    ));
+    ];
+  }
+  function pollAsyncJob(pollFn, id, resolve, reject) {
+    let payload;
+    try {
+      payload = pollFn(id);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    if (!payload.done) {
+      setTimeout(() => pollAsyncJob(pollFn, id, resolve, reject), 1);
+      return;
+    }
+    if (payload.error) reject(new Error(payload.error));
+    else resolve(payload.result);
+  }
+  processObj.execFileSync = function execFileSync(file, args = [], options = {}) {
+    return __qjs_exec_file(...execFileArgs(file, args, options));
+  };
+  processObj.execFile = function execFile(file, args = [], options = {}) {
+    return new Promise((resolve, reject) => {
+      let id;
+      try {
+        id = __qjs_exec_file_async_start(...execFileArgs(file, args, options));
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      setTimeout(() => pollAsyncJob(__qjs_exec_file_async_poll, id, resolve, reject), 0);
+    });
   };
   const signalCallbacks = new Map();
   processObj.onSignal = function onSignal(signalName, callback) {
@@ -2017,4 +2463,85 @@ const txikiRuntimeScript = `
   define(qjs, "process", processObj, true);
   define(globalThis, "process", processObj);
 })();
+`
+
+const txikiFSModuleScript = `
+const fs = globalThis.qjs && globalThis.qjs.fs;
+if (!fs) throw new Error("qjs fs runtime is not installed");
+const promises = fs.promises;
+const readFile = fs.readFile;
+const readFileText = fs.readFileText;
+const writeFile = fs.writeFile;
+const mkdir = fs.mkdir;
+const makeDir = fs.makeDir;
+const readdir = fs.readdir;
+const readDir = fs.readDir;
+const stat = fs.stat;
+const exists = fs.exists;
+const remove = fs.remove;
+const rm = fs.rm;
+const readFileSync = fs.readFileSync;
+const readFileTextSync = fs.readFileTextSync;
+const writeFileSync = fs.writeFileSync;
+const mkdirSync = fs.mkdirSync;
+const readdirSync = fs.readdirSync;
+const statSync = fs.statSync;
+const existsSync = fs.existsSync;
+const removeSync = fs.removeSync;
+const rmSync = fs.rmSync;
+export {
+  promises,
+  readFile,
+  readFileText,
+  writeFile,
+  mkdir,
+  makeDir,
+  readdir,
+  readDir,
+  stat,
+  exists,
+  remove,
+  rm,
+  readFileSync,
+  readFileTextSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  existsSync,
+  removeSync,
+  rmSync
+};
+export default fs;
+`
+
+const txikiFSPromisesModuleScript = `
+const fs = globalThis.qjs && globalThis.qjs.fs;
+if (!fs) throw new Error("qjs fs runtime is not installed");
+const promises = fs.promises;
+const readFile = promises.readFile;
+const readFileText = promises.readFileText;
+const writeFile = promises.writeFile;
+const mkdir = promises.mkdir;
+const makeDir = promises.mkdir;
+const readdir = promises.readdir;
+const readDir = promises.readDir;
+const stat = promises.stat;
+const exists = promises.exists;
+const remove = promises.remove;
+const rm = promises.rm;
+export {
+  readFile,
+  readFileText,
+  writeFile,
+  mkdir,
+  makeDir,
+  readdir,
+  readDir,
+  stat,
+  exists,
+  remove,
+  rm
+};
+export default promises;
 `
