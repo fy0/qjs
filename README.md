@@ -269,6 +269,83 @@ defer result.Free()
 log.Println(result.String())
 ```
 
+### Optional txiki.js-inspired runtime APIs
+
+QJS keeps the default runtime minimal. Install the optional host-backed APIs when a runtime should expose Web-like and system features:
+
+```go
+rt, err := qjs.New(qjs.Option{CWD: "/app/sandbox"})
+if err != nil {
+	log.Fatal(err)
+}
+defer rt.Close()
+
+if err := rt.InstallTxikiRuntime(); err != nil {
+	log.Fatal(err)
+}
+
+result, err := rt.Eval("app.js", qjs.Code(`
+	export default await (async () => {
+		console.log("runtime ready");
+		qjs.fs.writeFile("hello.txt", "hello");
+		const res = await fetch("https://example.com");
+		const digest = await crypto.subtle.digest("SHA-256", new Uint8Array([1, 2, 3]));
+		return {
+			file: qjs.fs.readFile("hello.txt", "utf8"),
+			status: res.status,
+			digestBytes: digest.byteLength,
+		};
+	})();
+`), qjs.TypeModule())
+if err != nil {
+	log.Fatal(err)
+}
+defer result.Free()
+```
+
+The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, `process.execFile`, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`.
+
+```go
+result, err := rt.Eval("net.js", qjs.Code(`
+	export default await (async () => {
+		const server = qjs.http.serve({ hostname: "127.0.0.1", port: 8080 });
+		const request = await server.accept();
+		if (request.websocket) {
+			const ws = await request.upgrade();
+			const message = await ws.readText();
+			ws.send("echo:" + message);
+			ws.close();
+		} else {
+			request.respond("ok", { status: 200 });
+		}
+		server.close();
+		return true;
+	})();
+`), qjs.TypeModule())
+```
+
+Worker messages use JSON serialization and explicit polling on the parent runtime:
+
+```go
+result, err := rt.Eval("worker.js", qjs.Code(`
+	export default await (async () => {
+		const worker = new Worker(
+			"self.onmessage = e => self.postMessage(e.data + 1)",
+			{ eval: true },
+		);
+		const messages = [];
+		worker.onmessage = event => messages.push(event.data);
+		worker.postMessage(41);
+		while (messages.length === 0) {
+			worker.pollMessages();
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+		worker.terminate();
+		return messages[0];
+	})();
+`), qjs.TypeModule())
+```
+
 ### Call JS function from Go
 
 ```go

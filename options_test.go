@@ -3,6 +3,7 @@ package qjs_test
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"testing"
 
 	"github.com/fastschema/qjs"
@@ -45,6 +46,10 @@ func TestEvalOptions(t *testing.T) {
 		})
 
 		t.Run("deleted_working_directory", func(t *testing.T) {
+			if goruntime.GOOS == "windows" {
+				t.Skip("Windows does not allow removing the process working directory")
+			}
+
 			// Create a temporary directory and change to it
 			tempDir := t.TempDir()
 			subDir := filepath.Join(tempDir, "workdir")

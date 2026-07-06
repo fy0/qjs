@@ -1,0 +1,2020 @@
+package qjs
+
+import (
+	"bytes"
+	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	goruntime "runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const maxCryptoRandomValues = 65536
+
+// TxikiRuntimeOptions configures the optional host-backed runtime APIs inspired by txiki.js.
+type TxikiRuntimeOptions struct {
+	CWD         string
+	Stdout      io.Writer
+	Stderr      io.Writer
+	FetchClient *http.Client
+}
+
+type txikiRuntimeConfig struct {
+	cwd         string
+	stdout      io.Writer
+	stderr      io.Writer
+	fetchClient *http.Client
+}
+
+type txikiRuntimeState struct {
+	config  txikiRuntimeConfig
+	net     *txikiNetState
+	workers *txikiWorkerManager
+
+	nextSignalID int64
+	signalsMu    sync.Mutex
+	signals      map[int64]*txikiSignal
+	signalEvents []txikiSignalEvent
+}
+
+type txikiSignal struct {
+	id     int64
+	label  string
+	cancel context.CancelFunc
+	closed atomic.Bool
+}
+
+type txikiSignalEvent struct {
+	ID     int64  `json:"id"`
+	Signal string `json:"signal"`
+}
+
+type fetchPayload struct {
+	URL        string              `json:"url"`
+	Status     int                 `json:"status"`
+	StatusText string              `json:"statusText"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"body"`
+}
+
+type fetchRequest struct {
+	url     string
+	method  string
+	headers map[string][]string
+	body    []byte
+}
+
+type execFileRequest struct {
+	file      string
+	args      []string
+	cwd       string
+	env       map[string]string
+	input     []byte
+	timeoutMs int64
+	ctx       context.Context
+}
+
+// InstallTxikiRuntime installs optional Web-like and host runtime APIs on the runtime context.
+func (r *Runtime) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
+	if r == nil || r.context == nil {
+		return errors.New("runtime is closed")
+	}
+
+	return r.context.InstallTxikiRuntime(options...)
+}
+
+// InstallTxikiRuntime installs optional Web-like and host runtime APIs on the context.
+func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
+	if c == nil || c.runtime == nil {
+		return errors.New("context is closed")
+	}
+
+	config := c.newTxikiRuntimeConfig(options...)
+	state := &txikiRuntimeState{
+		config:  config,
+		net:     newTxikiNetState(),
+		workers: newTxikiWorkerManager(),
+		signals: make(map[int64]*txikiSignal),
+	}
+
+	c.runtime.addCleanup(state.close)
+	state.installHostFunctions(c)
+
+	result, err := c.Eval("txiki-runtime.js", Code(txikiRuntimeScript))
+	if result != nil {
+		result.Free()
+	}
+
+	return err
+}
+
+func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) txikiRuntimeConfig {
+	var option TxikiRuntimeOptions
+	if len(options) > 0 {
+		option = options[0]
+	}
+
+	if option.CWD == "" {
+		option.CWD = c.runtime.option.CWD
+	}
+
+	if option.Stdout == nil {
+		option.Stdout = c.runtime.option.Stdout
+	}
+
+	if option.Stderr == nil {
+		option.Stderr = c.runtime.option.Stderr
+	}
+
+	if option.FetchClient == nil {
+		option.FetchClient = http.DefaultClient
+	}
+
+	return txikiRuntimeConfig{
+		cwd:         option.CWD,
+		stdout:      option.Stdout,
+		stderr:      option.Stderr,
+		fetchClient: option.FetchClient,
+	}
+}
+
+func (s *txikiRuntimeState) installHostFunctions(c *Context) {
+	c.SetFunc("__qjs_console_print", s.consolePrint)
+	c.SetFunc("__qjs_now_unix_ms", func(this *This) (*Value, error) {
+		return this.Context().NewInt64(time.Now().UnixMilli()), nil
+	})
+	c.SetFunc("__qjs_sleep", s.sleep)
+	c.SetFunc("__qjs_crypto_random", s.cryptoRandom)
+	c.SetFunc("__qjs_crypto_uuid", s.cryptoUUID)
+	c.SetFunc("__qjs_crypto_digest", s.cryptoDigest)
+	c.SetFunc("__qjs_fetch", s.fetch)
+	c.SetFunc("__qjs_fs_read_file", s.fsReadFile)
+	c.SetFunc("__qjs_fs_read_text", s.fsReadText)
+	c.SetFunc("__qjs_fs_write_file", s.fsWriteFile)
+	c.SetFunc("__qjs_fs_mkdir", s.fsMkdir)
+	c.SetFunc("__qjs_fs_readdir", s.fsReaddir)
+	c.SetFunc("__qjs_fs_stat", s.fsStat)
+	c.SetFunc("__qjs_fs_exists", s.fsExists)
+	c.SetFunc("__qjs_fs_remove", s.fsRemove)
+	c.SetFunc("__qjs_process_env_json", s.processEnvJSON)
+	c.SetFunc("__qjs_exec_file", s.execFile)
+	c.SetFunc("__qjs_signal_on", s.signalOn)
+	c.SetFunc("__qjs_signal_off", s.signalOff)
+	c.SetFunc("__qjs_signal_poll", s.signalPoll)
+	s.installNetHostFunctions(c)
+	s.installWorkerHostFunctions(c)
+}
+
+func (s *txikiRuntimeState) sleep(this *This) (*Value, error) {
+	delay := int64(0)
+	if args := this.Args(); len(args) > 0 {
+		delay = args[0].Int64()
+	}
+	if delay < 0 {
+		delay = 0
+	}
+
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) consolePrint(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) < 2 {
+		return this.Context().NewUndefined(), nil
+	}
+
+	level := args[0].String()
+	message := args[1].String()
+	out := s.config.stdout
+	if level == "error" || level == "warn" || level == "trace" {
+		out = s.config.stderr
+	}
+
+	if out != nil {
+		fmt.Fprintln(out, message)
+	}
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) cryptoRandom(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("crypto random requires a byte length")
+	}
+
+	size := args[0].Int64()
+	if size < 0 || size > maxCryptoRandomValues {
+		return nil, fmt.Errorf("crypto random byte length must be between 0 and %d", maxCryptoRandomValues)
+	}
+
+	data := make([]byte, size)
+	if _, err := cryptorand.Read(data); err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewArrayBuffer(data), nil
+}
+
+func (s *txikiRuntimeState) cryptoUUID(this *This) (*Value, error) {
+	data := make([]byte, 16)
+	if _, err := cryptorand.Read(data); err != nil {
+		return nil, err
+	}
+
+	data[6] = (data[6] & 0x0f) | 0x40
+	data[8] = (data[8] & 0x3f) | 0x80
+
+	uuid := fmt.Sprintf(
+		"%s-%s-%s-%s-%s",
+		hex.EncodeToString(data[0:4]),
+		hex.EncodeToString(data[4:6]),
+		hex.EncodeToString(data[6:8]),
+		hex.EncodeToString(data[8:10]),
+		hex.EncodeToString(data[10:16]),
+	)
+
+	return this.Context().NewString(uuid), nil
+}
+
+func (s *txikiRuntimeState) cryptoDigest(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) < 2 {
+		return nil, errors.New("crypto.subtle.digest requires algorithm and data")
+	}
+
+	algorithm := normalizeDigestAlgorithm(args[0].String())
+	data, err := jsValueToBytes(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	var digest []byte
+	switch algorithm {
+	case "SHA-1":
+		sum := sha1.Sum(data)
+		digest = sum[:]
+	case "SHA-256":
+		sum := sha256.Sum256(data)
+		digest = sum[:]
+	case "SHA-384":
+		sum := sha512.Sum384(data)
+		digest = sum[:]
+	case "SHA-512":
+		sum := sha512.Sum512(data)
+		digest = sum[:]
+	default:
+		return nil, fmt.Errorf("unsupported digest algorithm %q", args[0].String())
+	}
+
+	return this.Context().NewArrayBuffer(digest), nil
+}
+
+func normalizeDigestAlgorithm(algorithm string) string {
+	algorithm = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(algorithm), "_", "-"))
+	switch algorithm {
+	case "SHA1":
+		return "SHA-1"
+	case "SHA256":
+		return "SHA-256"
+	case "SHA384":
+		return "SHA-384"
+	case "SHA512":
+		return "SHA-512"
+	default:
+		return algorithm
+	}
+}
+
+func (s *txikiRuntimeState) fetch(this *This) (*Value, error) {
+	request, err := s.newFetchRequest(this)
+	if err != nil {
+		return nil, err
+	}
+
+	payload, err := s.doFetch(this.Context().Context, request)
+	if err != nil {
+		return nil, err
+	}
+
+	return ToJsValue(this.Context(), payload)
+}
+
+func (s *txikiRuntimeState) newFetchRequest(this *This) (fetchRequest, error) {
+	args := this.Args()
+	if len(args) < 4 {
+		return fetchRequest{}, errors.New("fetch requires url, method, headers, and body")
+	}
+
+	url := args[0].String()
+	method := strings.TrimSpace(args[1].String())
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	var bodyBytes []byte
+	if !args[3].IsNull() && !args[3].IsUndefined() {
+		var err error
+		bodyBytes, err = jsValueToBytes(args[3])
+		if err != nil {
+			return fetchRequest{}, err
+		}
+	}
+
+	var headers map[string][]string
+	if headerJSON := args[2].String(); headerJSON != "" {
+		if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+			return fetchRequest{}, fmt.Errorf("invalid fetch headers: %w", err)
+		}
+	}
+
+	return fetchRequest{url: url, method: method, headers: headers, body: bodyBytes}, nil
+}
+
+func (s *txikiRuntimeState) doFetch(ctx context.Context, request fetchRequest) (fetchPayload, error) {
+	var body io.Reader
+	if request.body != nil {
+		body = bytes.NewReader(request.body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, request.method, request.url, body)
+	if err != nil {
+		return fetchPayload{}, err
+	}
+
+	for name, values := range request.headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+
+	resp, err := s.config.fetchClient.Do(req)
+	if err != nil {
+		return fetchPayload{}, err
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fetchPayload{}, err
+	}
+
+	return fetchPayload{
+		URL:        resp.Request.URL.String(),
+		Status:     resp.StatusCode,
+		StatusText: http.StatusText(resp.StatusCode),
+		Headers:    map[string][]string(resp.Header),
+		Body:       responseBody,
+	}, nil
+}
+
+func (s *txikiRuntimeState) fsReadFile(this *This) (*Value, error) {
+	path, err := s.pathArg(this)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewArrayBuffer(data), nil
+}
+
+func (s *txikiRuntimeState) fsReadText(this *This) (*Value, error) {
+	path, err := s.pathArg(this)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewString(string(data)), nil
+}
+
+func (s *txikiRuntimeState) fsWriteFile(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) < 2 {
+		return nil, errors.New("writeFile requires path and data")
+	}
+
+	path, err := s.resolvePath(args[0].String())
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := jsValueToBytes(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) fsMkdir(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("mkdir requires a path")
+	}
+
+	path, err := s.resolvePath(args[0].String())
+	if err != nil {
+		return nil, err
+	}
+
+	recursive := len(args) > 1 && args[1].Bool()
+	if recursive {
+		err = os.MkdirAll(path, 0o755)
+	} else {
+		err = os.Mkdir(path, 0o755)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) fsReaddir(this *This) (*Value, error) {
+	path, err := s.pathArg(this)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+
+	return ToJsValue(this.Context(), names)
+}
+
+func (s *txikiRuntimeState) fsStat(this *This) (*Value, error) {
+	path, err := s.pathArg(this)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	stat := map[string]any{
+		"name":    info.Name(),
+		"size":    info.Size(),
+		"mode":    info.Mode().String(),
+		"modTime": info.ModTime(),
+		"isFile":  !info.IsDir(),
+		"isDir":   info.IsDir(),
+	}
+
+	return ToJsValue(this.Context(), stat)
+}
+
+func (s *txikiRuntimeState) fsExists(this *This) (*Value, error) {
+	path, err := s.pathArg(this)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = os.Stat(path)
+	if err == nil {
+		return this.Context().NewBool(true), nil
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		return this.Context().NewBool(false), nil
+	}
+
+	return nil, err
+}
+
+func (s *txikiRuntimeState) fsRemove(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("remove requires a path")
+	}
+
+	path, err := s.resolvePath(args[0].String())
+	if err != nil {
+		return nil, err
+	}
+
+	recursive := len(args) > 1 && args[1].Bool()
+	if recursive {
+		err = os.RemoveAll(path)
+	} else {
+		err = os.Remove(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) pathArg(this *This) (string, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return "", errors.New("path is required")
+	}
+
+	return s.resolvePath(args[0].String())
+}
+
+func (s *txikiRuntimeState) resolvePath(name string) (string, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", errors.New("path is required")
+	}
+
+	root, err := filepath.Abs(s.config.cwd)
+	if err != nil {
+		return "", err
+	}
+
+	cleanName := filepath.Clean(filepath.FromSlash(name))
+	if filepath.IsAbs(cleanName) {
+		volume := filepath.VolumeName(cleanName)
+		cleanName = strings.TrimPrefix(cleanName, volume)
+		cleanName = strings.TrimLeft(cleanName, `\/`)
+	}
+
+	fullPath := filepath.Join(root, cleanName)
+	fullPath, err = filepath.Abs(fullPath)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(root, fullPath)
+	if err != nil {
+		return "", err
+	}
+
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes runtime CWD", name)
+	}
+
+	return fullPath, nil
+}
+
+func (s *txikiRuntimeState) processEnvJSON(this *This) (*Value, error) {
+	env := map[string]string{}
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+
+	data, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewString(string(data)), nil
+}
+
+func (s *txikiRuntimeState) execFile(this *This) (*Value, error) {
+	request, err := s.newExecFileRequest(this)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := s.doExecFile(request)
+	if err != nil {
+		return nil, err
+	}
+
+	return ToJsValue(this.Context(), result)
+}
+
+func (s *txikiRuntimeState) newExecFileRequest(this *This) (execFileRequest, error) {
+	args := this.Args()
+	if len(args) < 6 {
+		return execFileRequest{}, errors.New("execFile requires file, args, cwd, env, input, and timeout arguments")
+	}
+
+	file := args[0].String()
+	cmdArgs, err := parseJSONStringSlice(args[1].String())
+	if err != nil {
+		return execFileRequest{}, fmt.Errorf("invalid execFile args: %w", err)
+	}
+
+	cwd := s.config.cwd
+	if argCWD := strings.TrimSpace(args[2].String()); argCWD != "" {
+		cwd, err = s.resolvePath(argCWD)
+		if err != nil {
+			return execFileRequest{}, err
+		}
+	}
+
+	envMap := map[string]string{}
+	if envJSON := args[3].String(); envJSON != "" {
+		if err := json.Unmarshal([]byte(envJSON), &envMap); err != nil {
+			return execFileRequest{}, fmt.Errorf("invalid execFile env: %w", err)
+		}
+	}
+
+	var input []byte
+	if !args[4].IsNull() && !args[4].IsUndefined() {
+		input, err = jsValueToBytes(args[4])
+		if err != nil {
+			return execFileRequest{}, err
+		}
+	}
+
+	return execFileRequest{
+		file:      file,
+		args:      cmdArgs,
+		cwd:       cwd,
+		env:       envMap,
+		input:     input,
+		timeoutMs: args[5].Int64(),
+		ctx:       this.Context().Context,
+	}, nil
+}
+
+func (s *txikiRuntimeState) doExecFile(request execFileRequest) (map[string]any, error) {
+	execCtx := request.ctx
+	cancel := func() {}
+	if request.timeoutMs > 0 {
+		execCtx, cancel = context.WithTimeout(execCtx, time.Duration(request.timeoutMs)*time.Millisecond)
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, request.file, request.args...)
+	cmd.Dir = request.cwd
+	cmd.Env = mergeEnv(os.Environ(), request.env)
+	if request.input != nil {
+		cmd.Stdin = bytes.NewReader(request.input)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("execFile timed out after %dms", request.timeoutMs)
+	}
+
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(runErr, &exitErr) {
+			return nil, runErr
+		}
+	}
+
+	return map[string]any{
+		"exitCode": exitCode,
+		"success":  exitCode == 0,
+		"stdout":   stdout.String(),
+		"stderr":   stderr.String(),
+	}, nil
+}
+
+func parseJSONStringSlice(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	var values []string
+	err := json.Unmarshal([]byte(raw), &values)
+
+	return values, err
+}
+
+func mergeEnv(base []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+
+	merged := map[string]string{}
+	for _, item := range base {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			merged[key] = value
+		}
+	}
+
+	for key, value := range overrides {
+		merged[key] = value
+	}
+
+	keys := make([]string, 0, len(merged))
+	for key := range merged {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, key+"="+merged[key])
+	}
+
+	return result
+}
+
+func (s *txikiRuntimeState) signalOn(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("onSignal requires a signal name")
+	}
+
+	sig, label, err := parsePortableSignal(args[0].String())
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	id := atomic.AddInt64(&s.nextSignalID, 1)
+	watcher := &txikiSignal{
+		id:     id,
+		label:  label,
+		cancel: cancel,
+	}
+
+	s.signalsMu.Lock()
+	s.signals[id] = watcher
+	s.signalsMu.Unlock()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, sig)
+	go func() {
+		defer signal.Stop(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ch:
+				s.enqueueSignal(watcher)
+			}
+		}
+	}()
+
+	return this.Context().NewInt64(id), nil
+}
+
+func (s *txikiRuntimeState) enqueueSignal(watcher *txikiSignal) {
+	if watcher == nil || watcher.closed.Load() {
+		return
+	}
+
+	s.signalsMu.Lock()
+	if !watcher.closed.Load() {
+		s.signalEvents = append(s.signalEvents, txikiSignalEvent{ID: watcher.id, Signal: watcher.label})
+	}
+	s.signalsMu.Unlock()
+}
+
+func (s *txikiRuntimeState) signalPoll(this *This) (*Value, error) {
+	s.signalsMu.Lock()
+	events := s.signalEvents
+	s.signalEvents = nil
+	s.signalsMu.Unlock()
+
+	return ToJsValue(this.Context(), events)
+}
+
+func parsePortableSignal(name string) (os.Signal, string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(name))
+	normalized = strings.TrimPrefix(normalized, "SIG")
+	switch normalized {
+	case "INT", "INTERRUPT":
+		return os.Interrupt, "SIGINT", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported portable signal %q", name)
+	}
+}
+
+func (s *txikiRuntimeState) signalOff(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return this.Context().NewUndefined(), nil
+	}
+
+	s.deleteSignal(args[0].Int64())
+
+	return this.Context().NewUndefined(), nil
+}
+
+func (s *txikiRuntimeState) deleteSignal(id int64) {
+	s.signalsMu.Lock()
+	watcher := s.signals[id]
+	delete(s.signals, id)
+	s.signalsMu.Unlock()
+
+	if watcher != nil {
+		watcher.close()
+	}
+}
+
+func (s *txikiSignal) close() {
+	s.closed.Store(true)
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+func (s *txikiRuntimeState) close() {
+	if s.net != nil {
+		s.net.close()
+	}
+	if s.workers != nil {
+		s.workers.close()
+	}
+
+	s.signalsMu.Lock()
+	signals := make([]*txikiSignal, 0, len(s.signals))
+	for id, watcher := range s.signals {
+		delete(s.signals, id)
+		signals = append(signals, watcher)
+	}
+	s.signalsMu.Unlock()
+
+	for _, watcher := range signals {
+		watcher.close()
+	}
+}
+
+func jsValueToBytes(value *Value) ([]byte, error) {
+	switch {
+	case value == nil || value.IsNull() || value.IsUndefined():
+		return nil, nil
+	case value.IsString():
+		return []byte(value.String()), nil
+	case value.IsByteArray():
+		data := value.ToByteArray()
+		return append([]byte(nil), data...), nil
+	case IsTypedArray(value):
+		data, err := JsTypedArrayToGo(value)
+		if err != nil {
+			return nil, err
+		}
+
+		return append([]byte(nil), data...), nil
+	case value.String() == "[object ArrayBuffer]":
+		data := value.ToByteArray()
+		return append([]byte(nil), data...), nil
+	default:
+		return nil, fmt.Errorf("expected string, ArrayBuffer, or TypedArray, got %s", value.Type())
+	}
+}
+
+const txikiRuntimeScript = `
+(function () {
+  const define = (target, name, value, enumerable) => {
+    Object.defineProperty(target, name, {
+      configurable: true,
+      writable: true,
+      enumerable: !!enumerable,
+      value
+    });
+  };
+
+  const qjs = globalThis.qjs && typeof globalThis.qjs === "object" ? globalThis.qjs : {};
+  define(globalThis, "qjs", qjs);
+  if (typeof globalThis.self === "undefined") define(globalThis, "self", globalThis);
+  const nativeSetTimeout = globalThis.setTimeout;
+  const nativeClearTimeout = globalThis.clearTimeout;
+  const nativeSetInterval = globalThis.setInterval;
+  const nativeClearInterval = globalThis.clearInterval;
+
+  if (typeof globalThis.DOMException !== "function") {
+    class DOMException extends Error {
+      constructor(message = "", name = "Error") {
+        super(String(message));
+        this.name = String(name);
+      }
+    }
+    define(globalThis, "DOMException", DOMException);
+  }
+
+  if (typeof globalThis.Event !== "function") {
+    class Event {
+      constructor(type, options = {}) {
+        this.type = String(type);
+        this.bubbles = !!options.bubbles;
+        this.cancelable = !!options.cancelable;
+        this.composed = !!options.composed;
+        this.defaultPrevented = false;
+        this.target = null;
+        this.currentTarget = null;
+        this.timeStamp = Date.now();
+      }
+      preventDefault() {
+        if (this.cancelable) this.defaultPrevented = true;
+      }
+      stopPropagation() {}
+      stopImmediatePropagation() {}
+    }
+    define(globalThis, "Event", Event);
+  }
+
+  if (typeof globalThis.EventTarget !== "function") {
+    class EventTarget {
+      constructor() {
+        this.__qjsListeners = new Map();
+      }
+      addEventListener(type, callback) {
+        if (callback == null) return;
+        type = String(type);
+        if (!this.__qjsListeners.has(type)) this.__qjsListeners.set(type, new Set());
+        this.__qjsListeners.get(type).add(callback);
+      }
+      removeEventListener(type, callback) {
+        const callbacks = this.__qjsListeners.get(String(type));
+        if (callbacks) callbacks.delete(callback);
+      }
+      dispatchEvent(event) {
+        if (!event || typeof event.type !== "string") throw new TypeError("event type is required");
+        if (!event.target) event.target = this;
+        event.currentTarget = this;
+        const callbacks = this.__qjsListeners.get(event.type);
+        if (callbacks) {
+          for (const callback of Array.from(callbacks)) {
+            if (typeof callback === "function") callback.call(this, event);
+            else if (callback && typeof callback.handleEvent === "function") callback.handleEvent(event);
+          }
+        }
+        const handler = this["on" + event.type];
+        if (typeof handler === "function") handler.call(this, event);
+        return !event.defaultPrevented;
+      }
+    }
+    define(globalThis, "EventTarget", EventTarget);
+  }
+
+  if (typeof globalThis.MessageEvent !== "function") {
+    class MessageEvent extends Event {
+      constructor(type, options = {}) {
+        super(type, options);
+        this.data = options.data;
+        this.origin = options.origin || "";
+        this.lastEventId = options.lastEventId || "";
+        this.source = options.source || null;
+        this.ports = options.ports || [];
+      }
+    }
+    define(globalThis, "MessageEvent", MessageEvent);
+  }
+
+  if (typeof globalThis.ErrorEvent !== "function") {
+    class ErrorEvent extends Event {
+      constructor(type, options = {}) {
+        super(type, options);
+        this.message = options.message || "";
+        this.filename = options.filename || "";
+        this.lineno = options.lineno || 0;
+        this.colno = options.colno || 0;
+        this.error = options.error;
+      }
+    }
+    define(globalThis, "ErrorEvent", ErrorEvent);
+  }
+
+  if (typeof globalThis.AbortController !== "function") {
+    class AbortSignal extends EventTarget {
+      constructor() {
+        super();
+        this.aborted = false;
+        this.reason = undefined;
+      }
+      throwIfAborted() {
+        if (this.aborted) throw this.reason;
+      }
+    }
+    class AbortController {
+      constructor() {
+        this.signal = new AbortSignal();
+      }
+      abort(reason) {
+        const signal = this.signal;
+        if (signal.aborted) return;
+        signal.aborted = true;
+        signal.reason = reason === undefined ? new DOMException("This operation was aborted", "AbortError") : reason;
+        signal.dispatchEvent(new Event("abort"));
+      }
+    }
+    define(globalThis, "AbortSignal", AbortSignal);
+    define(globalThis, "AbortController", AbortController);
+  }
+
+  if (typeof globalThis.queueMicrotask !== "function") {
+    define(globalThis, "queueMicrotask", function queueMicrotask(callback) {
+      if (typeof callback !== "function") throw new TypeError("callback must be a function");
+      Promise.resolve().then(callback);
+    });
+  }
+
+  if (typeof globalThis.performance !== "object") {
+    define(globalThis, "performance", {
+      timeOrigin: __qjs_now_unix_ms(),
+      now() {
+        return __qjs_now_unix_ms() - this.timeOrigin;
+      }
+    });
+  } else if (typeof globalThis.performance.now !== "function") {
+    globalThis.performance.now = function now() {
+      return __qjs_now_unix_ms();
+    };
+  }
+
+  if (typeof globalThis.atob !== "function" || typeof globalThis.btoa !== "function") {
+    const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const base64Lookup = Object.create(null);
+    for (let i = 0; i < base64Alphabet.length; i++) base64Lookup[base64Alphabet[i]] = i;
+    define(globalThis, "btoa", function btoa(input) {
+      const str = String(input);
+      let out = "";
+      for (let i = 0; i < str.length; i += 3) {
+        const a = str.charCodeAt(i);
+        const b = i + 1 < str.length ? str.charCodeAt(i + 1) : NaN;
+        const c = i + 2 < str.length ? str.charCodeAt(i + 2) : NaN;
+        if (a > 255 || b > 255 || c > 255) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError");
+        const triplet = (a << 16) | ((b || 0) << 8) | (c || 0);
+        out += base64Alphabet[(triplet >> 18) & 63];
+        out += base64Alphabet[(triplet >> 12) & 63];
+        out += Number.isNaN(b) ? "=" : base64Alphabet[(triplet >> 6) & 63];
+        out += Number.isNaN(c) ? "=" : base64Alphabet[triplet & 63];
+      }
+      return out;
+    });
+    define(globalThis, "atob", function atob(input) {
+      const str = String(input).replace(/[\t\n\f\r ]+/g, "");
+      if (str.length % 4 === 1) throw new DOMException("Invalid base64 input", "InvalidCharacterError");
+      let out = "";
+      for (let i = 0; i < str.length; i += 4) {
+        const a = base64Lookup[str[i]];
+        const b = base64Lookup[str[i + 1]];
+        const c = str[i + 2] === "=" || i + 2 >= str.length ? 0 : base64Lookup[str[i + 2]];
+        const d = str[i + 3] === "=" || i + 3 >= str.length ? 0 : base64Lookup[str[i + 3]];
+        if (a === undefined || b === undefined || c === undefined || d === undefined) throw new DOMException("Invalid base64 input", "InvalidCharacterError");
+        const triplet = (a << 18) | (b << 12) | (c << 6) | d;
+        out += String.fromCharCode((triplet >> 16) & 255);
+        if (str[i + 2] !== "=" && i + 2 < str.length) out += String.fromCharCode((triplet >> 8) & 255);
+        if (str[i + 3] !== "=" && i + 3 < str.length) out += String.fromCharCode(triplet & 255);
+      }
+      return out;
+    });
+  }
+
+  function utf8Encode(value) {
+    value = String(value);
+    const bytes = [];
+    for (let i = 0; i < value.length; i++) {
+      let code = value.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+        const next = value.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+          i++;
+        }
+      }
+      if (code <= 0x7f) {
+        bytes.push(code);
+      } else if (code <= 0x7ff) {
+        bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+      } else if (code <= 0xffff) {
+        bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+      } else {
+        bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+      }
+    }
+    return new Uint8Array(bytes);
+  }
+
+  function utf8Decode(input) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    let out = "";
+    for (let i = 0; i < bytes.length;) {
+      const b0 = bytes[i++];
+      if (b0 < 0x80) {
+        out += String.fromCharCode(b0);
+      } else if ((b0 & 0xe0) === 0xc0) {
+        const b1 = bytes[i++] & 0x3f;
+        out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+      } else if ((b0 & 0xf0) === 0xe0) {
+        const b1 = bytes[i++] & 0x3f;
+        const b2 = bytes[i++] & 0x3f;
+        out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
+      } else {
+        const b1 = bytes[i++] & 0x3f;
+        const b2 = bytes[i++] & 0x3f;
+        const b3 = bytes[i++] & 0x3f;
+        let code = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
+        code -= 0x10000;
+        out += String.fromCharCode(0xd800 + (code >> 10), 0xdc00 + (code & 0x3ff));
+      }
+    }
+    return out;
+  }
+
+  if (typeof globalThis.TextEncoder !== "function") {
+    class TextEncoder {
+      constructor() {
+        this.encoding = "utf-8";
+      }
+      encode(input = "") {
+        return utf8Encode(input);
+      }
+      encodeInto(source, destination) {
+        const bytes = utf8Encode(source);
+        const written = Math.min(bytes.length, destination.length);
+        destination.set(bytes.subarray(0, written));
+        return { read: String(source).length, written };
+      }
+    }
+    define(globalThis, "TextEncoder", TextEncoder);
+  }
+
+  if (typeof globalThis.TextDecoder !== "function") {
+    class TextDecoder {
+      constructor(label = "utf-8") {
+        this.encoding = String(label).toLowerCase();
+        if (this.encoding !== "utf-8" && this.encoding !== "utf8") throw new RangeError("Only utf-8 TextDecoder is supported");
+        this.encoding = "utf-8";
+      }
+      decode(input = new Uint8Array()) {
+        return utf8Decode(input);
+      }
+    }
+    define(globalThis, "TextDecoder", TextDecoder);
+  }
+
+  const encoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+  const decoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
+
+  function encodeString(value) {
+    value = String(value);
+    if (encoder) return encoder.encode(value).buffer;
+    const bytes = new Uint8Array(value.length);
+    for (let i = 0; i < value.length; i++) bytes[i] = value.charCodeAt(i) & 0xff;
+    return bytes.buffer;
+  }
+
+  function decodeBytes(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    if (decoder) return decoder.decode(bytes);
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+
+  function toArrayBuffer(value) {
+    if (value == null) return null;
+    if (value instanceof ArrayBuffer) return value.slice(0);
+    if (ArrayBuffer.isView(value)) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+    if (typeof Blob !== "undefined" && value instanceof Blob) return value.arrayBufferSync();
+    return encodeString(value);
+  }
+
+  if (typeof globalThis.structuredClone !== "function") {
+    define(globalThis, "structuredClone", function structuredClone(value) {
+      const seen = new Map();
+      function clone(item) {
+        if (item === null || typeof item !== "object") return item;
+        if (seen.has(item)) return seen.get(item);
+        if (item instanceof Date) return new Date(item.getTime());
+        if (item instanceof RegExp) return new RegExp(item.source, item.flags);
+        if (item instanceof ArrayBuffer) return item.slice(0);
+        if (ArrayBuffer.isView(item)) return new item.constructor(item);
+        if (item instanceof Map) {
+          const out = new Map();
+          seen.set(item, out);
+          item.forEach((v, k) => out.set(clone(k), clone(v)));
+          return out;
+        }
+        if (item instanceof Set) {
+          const out = new Set();
+          seen.set(item, out);
+          item.forEach(v => out.add(clone(v)));
+          return out;
+        }
+        if (Array.isArray(item)) {
+          const out = [];
+          seen.set(item, out);
+          for (const entry of item) out.push(clone(entry));
+          return out;
+        }
+        const out = {};
+        seen.set(item, out);
+        for (const key of Object.keys(item)) out[key] = clone(item[key]);
+        return out;
+      }
+      return clone(value);
+    });
+  }
+
+  function concatUint8Arrays(chunks) {
+    let size = 0;
+    for (const chunk of chunks) size += chunk.byteLength;
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+
+  if (typeof globalThis.Blob !== "function") {
+    class Blob {
+      constructor(parts = [], options = {}) {
+        const chunks = [];
+        for (const part of parts) {
+          if (part instanceof Blob) chunks.push(new Uint8Array(part.arrayBufferSync()));
+          else chunks.push(new Uint8Array(toArrayBuffer(part) || new ArrayBuffer(0)));
+        }
+        this._bytes = concatUint8Arrays(chunks);
+        this.size = this._bytes.byteLength;
+        this.type = String(options.type || "").toLowerCase();
+      }
+      arrayBufferSync() {
+        return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.byteLength);
+      }
+      arrayBuffer() {
+        return Promise.resolve(this.arrayBufferSync());
+      }
+      text() {
+        return Promise.resolve(decodeBytes(this._bytes));
+      }
+      slice(start = 0, end = this.size, type = "") {
+        const size = this.size;
+        let relativeStart = start < 0 ? Math.max(size + start, 0) : Math.min(start, size);
+        let relativeEnd = end < 0 ? Math.max(size + end, 0) : Math.min(end, size);
+        const span = Math.max(relativeEnd - relativeStart, 0);
+        return new Blob([this._bytes.slice(relativeStart, relativeStart + span)], { type });
+      }
+    }
+    define(globalThis, "Blob", Blob);
+  }
+
+  if (typeof globalThis.File !== "function") {
+    class File extends Blob {
+      constructor(parts, name, options = {}) {
+        super(parts, options);
+        this.name = String(name);
+        this.lastModified = options.lastModified === undefined ? Date.now() : Number(options.lastModified);
+      }
+    }
+    define(globalThis, "File", File);
+  }
+
+  if (typeof globalThis.FormData !== "function") {
+    class FormData {
+      constructor() {
+        this._entries = [];
+      }
+      append(name, value, filename) {
+        let stored = value instanceof Blob ? value : String(value);
+        if (filename !== undefined && stored instanceof Blob && !(stored instanceof File)) stored = new File([stored], filename, { type: stored.type });
+        this._entries.push([String(name), stored]);
+      }
+      set(name, value, filename) {
+        name = String(name);
+        this.delete(name);
+        this.append(name, value, filename);
+      }
+      get(name) {
+        name = String(name);
+        const entry = this._entries.find(([key]) => key === name);
+        return entry ? entry[1] : null;
+      }
+      getAll(name) {
+        name = String(name);
+        return this._entries.filter(([key]) => key === name).map(([, value]) => value);
+      }
+      has(name) {
+        name = String(name);
+        return this._entries.some(([key]) => key === name);
+      }
+      delete(name) {
+        name = String(name);
+        this._entries = this._entries.filter(([key]) => key !== name);
+      }
+      entries() {
+        return this._entries[Symbol.iterator]();
+      }
+      keys() {
+        return this._entries.map(([key]) => key)[Symbol.iterator]();
+      }
+      values() {
+        return this._entries.map(([, value]) => value)[Symbol.iterator]();
+      }
+      forEach(callback, thisArg) {
+        for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
+      }
+      [Symbol.iterator]() {
+        return this.entries();
+      }
+    }
+    define(globalThis, "FormData", FormData);
+  }
+
+  if (typeof globalThis.URLSearchParams !== "function") {
+    class URLSearchParams {
+      constructor(init = "") {
+        this._entries = [];
+        if (typeof init === "string") {
+          const query = init.startsWith("?") ? init.slice(1) : init;
+          if (query) {
+            for (const pair of query.split("&")) {
+              if (pair === "") continue;
+              const index = pair.indexOf("=");
+              const key = index < 0 ? pair : pair.slice(0, index);
+              const value = index < 0 ? "" : pair.slice(index + 1);
+              this.append(decodeURIComponent(key.replace(/\+/g, " ")), decodeURIComponent(value.replace(/\+/g, " ")));
+            }
+          }
+        } else if (Array.isArray(init)) {
+          for (const pair of init) this.append(pair[0], pair[1]);
+        } else if (init && typeof init === "object") {
+          if (typeof init[Symbol.iterator] === "function") {
+            for (const pair of init) this.append(pair[0], pair[1]);
+          } else {
+            for (const key of Object.keys(init)) this.append(key, init[key]);
+          }
+        }
+      }
+      append(name, value) {
+        this._entries.push([String(name), String(value)]);
+      }
+      set(name, value) {
+        name = String(name);
+        this.delete(name);
+        this.append(name, value);
+      }
+      get(name) {
+        name = String(name);
+        const entry = this._entries.find(([key]) => key === name);
+        return entry ? entry[1] : null;
+      }
+      getAll(name) {
+        name = String(name);
+        return this._entries.filter(([key]) => key === name).map(([, value]) => value);
+      }
+      has(name) {
+        name = String(name);
+        return this._entries.some(([key]) => key === name);
+      }
+      delete(name) {
+        name = String(name);
+        this._entries = this._entries.filter(([key]) => key !== name);
+      }
+      sort() {
+        this._entries.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+      }
+      entries() {
+        return this._entries[Symbol.iterator]();
+      }
+      keys() {
+        return this._entries.map(([key]) => key)[Symbol.iterator]();
+      }
+      values() {
+        return this._entries.map(([, value]) => value)[Symbol.iterator]();
+      }
+      forEach(callback, thisArg) {
+        for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
+      }
+      toString() {
+        return this._entries.map(([key, value]) => encodeURIComponent(key).replace(/%20/g, "+") + "=" + encodeURIComponent(value).replace(/%20/g, "+")).join("&");
+      }
+      [Symbol.iterator]() {
+        return this.entries();
+      }
+    }
+    define(globalThis, "URLSearchParams", URLSearchParams);
+  }
+
+  function inspect(value, seen) {
+    if (typeof value === "string") return value;
+    if (typeof value === "undefined") return "undefined";
+    if (value === null) return "null";
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+    if (typeof value === "function") return "[Function" + (value.name ? ": " + value.name : "") + "]";
+    if (value instanceof Error) return value.stack || value.message || String(value);
+    seen = seen || new Set();
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    try {
+      const json = JSON.stringify(value);
+      if (json !== undefined) return json;
+    } catch (_) {}
+    try {
+      return String(value);
+    } catch (_) {
+      return Object.prototype.toString.call(value);
+    }
+  }
+
+  const countMap = new Map();
+  const timeMap = new Map();
+  const consoleObj = {
+    log: (...args) => __qjs_console_print("log", args.map(arg => inspect(arg)).join(" ")),
+    info: (...args) => __qjs_console_print("info", args.map(arg => inspect(arg)).join(" ")),
+    debug: (...args) => __qjs_console_print("debug", args.map(arg => inspect(arg)).join(" ")),
+    warn: (...args) => __qjs_console_print("warn", args.map(arg => inspect(arg)).join(" ")),
+    error: (...args) => __qjs_console_print("error", args.map(arg => inspect(arg)).join(" ")),
+    trace: (...args) => {
+      const err = new Error(args.map(arg => inspect(arg)).join(" "));
+      __qjs_console_print("trace", err.stack || err.message);
+    },
+    assert: (condition, ...args) => {
+      if (!condition) consoleObj.error("Assertion failed", ...args);
+    },
+    count: (label = "default") => {
+      label = String(label);
+      const count = (countMap.get(label) || 0) + 1;
+      countMap.set(label, count);
+      consoleObj.log(label + ": " + count);
+    },
+    countReset: (label = "default") => {
+      countMap.delete(String(label));
+    },
+    time: (label = "default") => {
+      timeMap.set(String(label), __qjs_now_unix_ms());
+    },
+    timeLog: (label = "default", ...args) => {
+      label = String(label);
+      if (!timeMap.has(label)) return consoleObj.warn("No such label", label);
+      consoleObj.log(label + ": " + (__qjs_now_unix_ms() - timeMap.get(label)) + "ms", ...args);
+    },
+    timeEnd: (label = "default") => {
+      label = String(label);
+      if (!timeMap.has(label)) return consoleObj.warn("No such label", label);
+      consoleObj.log(label + ": " + (__qjs_now_unix_ms() - timeMap.get(label)) + "ms");
+      timeMap.delete(label);
+    },
+    dir: value => consoleObj.log(value),
+    table: value => consoleObj.log(value),
+    clear: () => {}
+  };
+  define(globalThis, "console", consoleObj);
+
+  let nextTimerID = 1;
+  const activeTimers = new Map();
+
+  if (typeof nativeSetTimeout !== "function") {
+    define(globalThis, "setTimeout", function setTimeout(callback, delay = 0, ...args) {
+      if (typeof callback !== "function") callback = Function(String(callback));
+      const id = nextTimerID++;
+      const token = { active: true };
+      activeTimers.set(id, token);
+      __qjs_sleep(Number(delay) || 0);
+      if (!token.active) return;
+      activeTimers.delete(id);
+      callback(...args);
+      return id;
+    });
+
+    define(globalThis, "clearTimeout", function clearTimeout(id) {
+      const token = activeTimers.get(Number(id) || 0);
+      if (token) token.active = false;
+      activeTimers.delete(Number(id) || 0);
+    });
+
+    define(globalThis, "setInterval", function setInterval(callback, delay = 0, ...args) {
+      if (typeof callback !== "function") callback = Function(String(callback));
+      const id = nextTimerID++;
+      const token = { active: true };
+      activeTimers.set(id, token);
+      while (token.active) {
+        __qjs_sleep(Number(delay) || 0);
+        if (token.active) callback(...args);
+      }
+      return id;
+    });
+
+    define(globalThis, "clearInterval", function clearInterval(id) {
+      return clearTimeout(id);
+    });
+  } else {
+    if (typeof nativeClearTimeout === "function") define(globalThis, "clearTimeout", nativeClearTimeout);
+    if (typeof nativeSetInterval === "function") define(globalThis, "setInterval", nativeSetInterval);
+    if (typeof nativeClearInterval === "function") define(globalThis, "clearInterval", nativeClearInterval);
+  }
+
+  const cryptoObj = globalThis.crypto && typeof globalThis.crypto === "object" ? globalThis.crypto : {};
+  cryptoObj.getRandomValues = function getRandomValues(target) {
+    if (!ArrayBuffer.isView(target)) throw new TypeError("Expected an integer TypedArray");
+    if (target.byteLength > 65536) throw new Error("QuotaExceededError");
+    const random = new Uint8Array(__qjs_crypto_random(target.byteLength));
+    new Uint8Array(target.buffer, target.byteOffset, target.byteLength).set(random);
+    return target;
+  };
+  cryptoObj.randomUUID = function randomUUID() {
+    return __qjs_crypto_uuid();
+  };
+  cryptoObj.subtle = cryptoObj.subtle || {};
+  cryptoObj.subtle.digest = function digest(algorithm, data) {
+    const name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
+    return Promise.resolve(__qjs_crypto_digest(name, toArrayBuffer(data)));
+  };
+  define(globalThis, "crypto", cryptoObj);
+
+  class Headers {
+    constructor(init) {
+      this._values = Object.create(null);
+      if (!init) return;
+      if (init instanceof Headers) {
+        init.forEach((value, key) => this.append(key, value));
+      } else if (Array.isArray(init)) {
+        for (const pair of init) this.append(pair[0], pair[1]);
+      } else {
+        for (const key of Object.keys(init)) {
+          const value = init[key];
+          if (Array.isArray(value)) for (const item of value) this.append(key, item);
+          else this.set(key, value);
+        }
+      }
+    }
+    _key(name) { return String(name).toLowerCase(); }
+    append(name, value) {
+      const key = this._key(name);
+      if (!this._values[key]) this._values[key] = [];
+      this._values[key].push(String(value));
+    }
+    set(name, value) { this._values[this._key(name)] = [String(value)]; }
+    get(name) {
+      const value = this._values[this._key(name)];
+      return value ? value.join(", ") : null;
+    }
+    has(name) { return !!this._values[this._key(name)]; }
+    delete(name) { delete this._values[this._key(name)]; }
+    forEach(callback, thisArg) {
+      for (const [key, values] of Object.entries(this._values)) callback.call(thisArg, values.join(", "), key, this);
+    }
+    entries() {
+      return Object.entries(this._values).map(([key, values]) => [key, values.join(", ")])[Symbol.iterator]();
+    }
+    keys() { return Object.keys(this._values)[Symbol.iterator](); }
+    values() { return Object.values(this._values).map(values => values.join(", "))[Symbol.iterator](); }
+    toObject() {
+      const out = {};
+      for (const [key, values] of Object.entries(this._values)) out[key] = values.slice();
+      return out;
+    }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  define(globalThis, "Headers", Headers);
+
+  function headersToObject(headers) {
+    return new Headers(headers).toObject();
+  }
+
+  class Response {
+    constructor(payload) {
+      this.url = payload.url || "";
+      this.status = payload.status || 0;
+      this.statusText = payload.statusText || "";
+      this.ok = this.status >= 200 && this.status <= 299;
+      this.headers = new Headers(payload.headers || {});
+      this._body = toArrayBuffer(payload.body || new ArrayBuffer(0));
+      this.bodyUsed = false;
+    }
+    arrayBuffer() {
+      this.bodyUsed = true;
+      return Promise.resolve(this._body.slice(0));
+    }
+    text() {
+      this.bodyUsed = true;
+      return Promise.resolve(decodeBytes(this._body));
+    }
+    json() {
+      return this.text().then(JSON.parse);
+    }
+    clone() {
+      return new Response({
+        url: this.url,
+        status: this.status,
+        statusText: this.statusText,
+        headers: this.headers.toObject(),
+        body: this._body.slice(0)
+      });
+    }
+  }
+  define(globalThis, "Response", Response);
+
+  define(globalThis, "fetch", function fetch(input, init = {}) {
+    const url = typeof input === "string" ? input : input && input.url;
+    if (!url) return Promise.reject(new TypeError("fetch requires a URL"));
+    if (init.signal && init.signal.aborted) return Promise.reject(init.signal.reason || new DOMException("This operation was aborted", "AbortError"));
+    const method = String(init.method || "GET").toUpperCase();
+    const headers = headersToObject(init.headers || {});
+    const body = toArrayBuffer(init.body);
+    return Promise.resolve(__qjs_fetch(String(url), method, JSON.stringify(headers), body)).then(payload => new Response(payload));
+  });
+
+  const fs = qjs.fs || {};
+  fs.readFile = function readFile(path, options) {
+    const encoding = typeof options === "string" ? options : options && options.encoding;
+    return encoding ? __qjs_fs_read_text(String(path), String(encoding)) : __qjs_fs_read_file(String(path));
+  };
+  fs.readFileText = path => __qjs_fs_read_text(String(path), "utf8");
+  fs.writeFile = (path, data) => __qjs_fs_write_file(String(path), data);
+  fs.mkdir = (path, options = {}) => __qjs_fs_mkdir(String(path), !!options.recursive);
+  fs.readdir = path => __qjs_fs_readdir(String(path || "."));
+  fs.stat = path => __qjs_fs_stat(String(path));
+  fs.exists = path => __qjs_fs_exists(String(path));
+  fs.remove = (path, options = {}) => __qjs_fs_remove(String(path), !!options.recursive);
+  define(qjs, "fs", fs, true);
+
+  class TCPSocket {
+    constructor(remoteAddress, remotePort, options = {}, acceptedInfo) {
+      this._init(acceptedInfo || __qjs_tcp_connect(String(remoteAddress), Number(remotePort), Number(options.timeout || 0)));
+    }
+    static fromInfo(info) {
+      const socket = Object.create(TCPSocket.prototype);
+      socket._init(info);
+      return socket;
+    }
+    _init(info) {
+      this._id = info.id;
+      this.localAddress = info.localAddress || "";
+      this.localPort = info.localPort || 0;
+      this.remoteAddress = info.remoteAddress || "";
+      this.remotePort = info.remotePort || 0;
+      this.opened = Promise.resolve({
+        localAddress: this.localAddress,
+        localPort: this.localPort,
+        remoteAddress: this.remoteAddress,
+        remotePort: this.remotePort,
+        socket: this
+      });
+    }
+    read(maxBytes = 65536) {
+      return Promise.resolve(__qjs_tcp_read(this._id, Number(maxBytes) || 65536));
+    }
+    readText(maxBytes = 65536) {
+      return this.read(maxBytes).then(decodeBytes);
+    }
+    write(data) {
+      return Promise.resolve(__qjs_tcp_write(this._id, toArrayBuffer(data)));
+    }
+    close() {
+      if (this._id) __qjs_tcp_close(this._id);
+      this._id = 0;
+    }
+  }
+
+  class TCPServerSocket {
+    constructor(localAddress = "127.0.0.1", options = {}) {
+      const info = __qjs_tcp_listen(String(localAddress || "127.0.0.1"), Number(options.localPort || options.port || 0));
+      this._id = info.id;
+      this.localAddress = info.localAddress || "";
+      this.localPort = info.localPort || 0;
+      this.opened = Promise.resolve({
+        localAddress: this.localAddress,
+        localPort: this.localPort,
+        socket: this
+      });
+    }
+    accept() {
+      return Promise.resolve(TCPSocket.fromInfo(__qjs_tcp_accept(this._id)));
+    }
+    close() {
+      if (this._id) __qjs_tcp_close(this._id);
+      this._id = 0;
+    }
+  }
+
+  class UDPSocket {
+    constructor(options = {}) {
+      const info = __qjs_udp_bind(String(options.localAddress || "127.0.0.1"), Number(options.localPort || options.port || 0));
+      this._id = info.id;
+      this.localAddress = info.localAddress || "";
+      this.localPort = info.localPort || 0;
+      this.opened = Promise.resolve({
+        localAddress: this.localAddress,
+        localPort: this.localPort,
+        socket: this
+      });
+    }
+    send(data, remoteAddress, remotePort) {
+      if (data && typeof data === "object" && "data" in data) {
+        remoteAddress = data.remoteAddress;
+        remotePort = data.remotePort;
+        data = data.data;
+      }
+      return Promise.resolve(__qjs_udp_send(this._id, toArrayBuffer(data), String(remoteAddress), Number(remotePort)));
+    }
+    receive(maxBytes = 65536) {
+      return Promise.resolve(__qjs_udp_receive(this._id, Number(maxBytes) || 65536));
+    }
+    close() {
+      if (this._id) __qjs_udp_close(this._id);
+      this._id = 0;
+    }
+  }
+
+  class PipeSocket extends TCPSocket {
+    constructor(path) {
+      super("127.0.0.1", 0, {}, __qjs_unix_connect(String(path)));
+    }
+    static fromInfo(info) {
+      const socket = Object.create(PipeSocket.prototype);
+      socket._init(info);
+      socket.path = info.path || "";
+      return socket;
+    }
+  }
+
+  class PipeServerSocket {
+    constructor(path) {
+      const info = __qjs_unix_listen(String(path));
+      this._id = info.id;
+      this.path = info.path || String(path);
+      this.opened = Promise.resolve({ path: this.path, socket: this });
+    }
+    accept() {
+      return Promise.resolve(PipeSocket.fromInfo(__qjs_unix_accept(this._id)));
+    }
+    close() {
+      if (this._id) __qjs_tcp_close(this._id);
+      this._id = 0;
+    }
+  }
+
+  const net = qjs.net || {};
+  net.TCPSocket = TCPSocket;
+  net.TCPServerSocket = TCPServerSocket;
+  net.UDPSocket = UDPSocket;
+  net.PipeSocket = PipeSocket;
+  net.PipeServerSocket = PipeServerSocket;
+  net.connect = function connect(transport, host, port, options = {}) {
+    transport = String(transport);
+    if (transport === "tcp") return Promise.resolve(new TCPSocket(host, port, options));
+    if (transport === "udp") return Promise.resolve(new UDPSocket({ ...options, remoteAddress: host, remotePort: port }));
+    if (transport === "unix" || transport === "pipe") return Promise.resolve(new PipeSocket(host));
+    return Promise.reject(new TypeError("unsupported transport: " + transport));
+  };
+  net.listen = function listen(transport, host, port, options = {}) {
+    transport = String(transport);
+    if (transport === "tcp") return Promise.resolve(new TCPServerSocket(host, { ...options, localPort: port }));
+    if (transport === "udp") return Promise.resolve(new UDPSocket({ ...options, localAddress: host, localPort: port }));
+    if (transport === "unix" || transport === "pipe") return Promise.resolve(new PipeServerSocket(host));
+    return Promise.reject(new TypeError("unsupported transport: " + transport));
+  };
+  define(qjs, "net", net, true);
+  define(globalThis, "TCPSocket", TCPSocket);
+  define(globalThis, "TCPServerSocket", TCPServerSocket);
+  define(globalThis, "UDPSocket", UDPSocket);
+  define(globalThis, "PipeSocket", PipeSocket);
+  define(globalThis, "PipeServerSocket", PipeServerSocket);
+
+  class HostWebSocket extends EventTarget {
+    constructor() {
+      super();
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+    }
+    _init(info) {
+      if (!this.__qjsListeners) this.__qjsListeners = new Map();
+      this._id = info.id;
+      this.url = info.url || "";
+      this.path = info.path || "";
+      this.readyState = WebSocket.OPEN;
+      this.opened = Promise.resolve(this);
+      this.dispatchEvent(new Event("open"));
+    }
+    send(data) {
+      if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
+      return __qjs_ws_send(this._id, toArrayBuffer(data), data instanceof ArrayBuffer || ArrayBuffer.isView(data));
+    }
+    read() {
+      return Promise.resolve(__qjs_ws_read(this._id)).then(message => {
+        const data = message.opcode === 1 ? message.text : message.data;
+        this.dispatchEvent(new MessageEvent("message", { data }));
+        return message;
+      }).catch(error => {
+        this.dispatchEvent(new ErrorEvent("error", { error, message: String(error && error.message || error) }));
+        throw error;
+      });
+    }
+    readText() {
+      return this.read().then(message => message.text);
+    }
+    close() {
+      if (this.readyState === WebSocket.CLOSED) return;
+      this.readyState = WebSocket.CLOSED;
+      if (this._id) __qjs_ws_close(this._id);
+      this._id = 0;
+      this.dispatchEvent(new Event("close"));
+    }
+  }
+
+  class WebSocket extends HostWebSocket {
+    constructor(url, protocolsOrOptions) {
+      super();
+      this.readyState = WebSocket.CONNECTING;
+      this._init(__qjs_ws_connect(String(url), JSON.stringify({})));
+    }
+  }
+  WebSocket.CONNECTING = 0;
+  WebSocket.OPEN = 1;
+  WebSocket.CLOSING = 2;
+  WebSocket.CLOSED = 3;
+
+  class ServerWebSocket extends HostWebSocket {
+    static fromInfo(info) {
+      const ws = Object.create(ServerWebSocket.prototype);
+      ws._init(info);
+      return ws;
+    }
+  }
+
+  class HTTPRequest {
+    constructor(info) {
+      this.id = info.id;
+      this.serverId = info.serverId;
+      this.method = info.method;
+      this.url = info.url;
+      this.path = info.path;
+      this.headers = new Headers(info.headers || {});
+      this.websocket = !!info.websocket;
+      this._body = toArrayBuffer(info.body || new ArrayBuffer(0));
+    }
+    arrayBuffer() {
+      return Promise.resolve(this._body.slice(0));
+    }
+    text() {
+      return Promise.resolve(decodeBytes(this._body));
+    }
+    json() {
+      return this.text().then(JSON.parse);
+    }
+    respond(body = "", options = {}) {
+      const status = Number(options.status || 200);
+      const headers = headersToObject(options.headers || {});
+      __qjs_http_respond(this.id, status, JSON.stringify(headers), toArrayBuffer(body));
+    }
+    upgrade() {
+      return Promise.resolve(ServerWebSocket.fromInfo(__qjs_http_upgrade(this.id)));
+    }
+  }
+
+  class HTTPServer {
+    constructor(options = {}) {
+      const hostname = String(options.hostname || options.host || "127.0.0.1");
+      const port = Number(options.port || 0);
+      const info = __qjs_http_listen(hostname, port);
+      this._id = info.id;
+      this.hostname = info.localAddress || hostname;
+      this.port = info.localPort || 0;
+    }
+    accept() {
+      return Promise.resolve(new HTTPRequest(__qjs_http_accept(this._id)));
+    }
+    close() {
+      if (this._id) __qjs_http_close(this._id);
+      this._id = 0;
+    }
+  }
+
+  const httpRuntime = qjs.http || {};
+  httpRuntime.serve = function serve(options = {}) {
+    return new HTTPServer(options);
+  };
+  httpRuntime.HTTPServer = HTTPServer;
+  httpRuntime.HTTPRequest = HTTPRequest;
+  httpRuntime.ServerWebSocket = ServerWebSocket;
+  define(qjs, "http", httpRuntime, true);
+  define(qjs, "serve", httpRuntime.serve, true);
+  define(globalThis, "WebSocket", WebSocket);
+
+  function serializeWorkerMessage(value) {
+    const raw = JSON.stringify(value);
+    return raw === undefined ? "null" : raw;
+  }
+
+  function parseWorkerMessage(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return raw;
+    }
+  }
+
+  class Worker extends EventTarget {
+    constructor(source, options = {}) {
+      super();
+      this._id = __qjs_worker_create(String(source), JSON.stringify(options || {}));
+      this.onmessage = null;
+      this.onerror = null;
+    }
+    postMessage(value) {
+      return __qjs_worker_post(this._id, serializeWorkerMessage(value));
+    }
+    pollMessages() {
+      const messages = __qjs_worker_poll(this._id);
+      for (const raw of messages) {
+        this.dispatchEvent(new MessageEvent("message", {
+          data: parseWorkerMessage(raw),
+          target: this,
+          currentTarget: this
+        }));
+      }
+
+      const err = __qjs_worker_error(this._id);
+      if (err) {
+        this.dispatchEvent(new ErrorEvent("error", {
+          message: err,
+          error: new Error(err),
+          target: this,
+          currentTarget: this
+        }));
+      }
+
+      return messages.length;
+    }
+    terminate() {
+      if (this._id) __qjs_worker_terminate(this._id);
+      this._id = 0;
+    }
+  }
+
+  define(globalThis, "Worker", Worker);
+
+  const processObj = qjs.process || {};
+  processObj.pid = 0;
+  processObj.platform = "` + goruntime.GOOS + `";
+  processObj.arch = "` + goruntime.GOARCH + `";
+  processObj.cwd = () => ".";
+  processObj.env = JSON.parse(__qjs_process_env_json());
+  processObj.execFile = function execFile(file, args = [], options = {}) {
+    const input = options.input == null ? null : toArrayBuffer(options.input);
+    return Promise.resolve(__qjs_exec_file(
+      String(file),
+      JSON.stringify(args.map(String)),
+      options.cwd ? String(options.cwd) : "",
+      JSON.stringify(options.env || {}),
+      input,
+      Number(options.timeout || 0)
+    ));
+  };
+  const signalCallbacks = new Map();
+  processObj.onSignal = function onSignal(signalName, callback) {
+    if (typeof callback !== "function") throw new TypeError("signal callback must be a function");
+    const id = __qjs_signal_on(String(signalName));
+    signalCallbacks.set(id, callback);
+    return () => {
+      signalCallbacks.delete(id);
+      __qjs_signal_off(id);
+    };
+  };
+  processObj.pollSignals = function pollSignals() {
+    const events = __qjs_signal_poll();
+    for (const event of events) {
+      const callback = signalCallbacks.get(event.id);
+      if (callback) callback(event.signal);
+    }
+    return events.length;
+  };
+  define(qjs, "process", processObj, true);
+  define(globalThis, "process", processObj);
+})();
+`

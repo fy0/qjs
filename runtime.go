@@ -34,6 +34,9 @@ type Runtime struct {
 	handle   *Handle
 	context  *Context
 	registry *ProxyRegistry
+
+	cleanupMu sync.Mutex
+	cleanups  []func()
 }
 
 func createGlobalCompiledModule(
@@ -187,6 +190,8 @@ func (r *Runtime) Close() {
 		return
 	}
 
+	r.runCleanups()
+
 	// Free QJS runtime handle
 	if r.handle != nil {
 		r.FreeQJSRuntime()
@@ -213,6 +218,27 @@ func (r *Runtime) Close() {
 	r.malloc = nil
 	r.free = nil
 	r.mem = nil
+}
+
+func (r *Runtime) addCleanup(fn func()) {
+	if r == nil || fn == nil {
+		return
+	}
+
+	r.cleanupMu.Lock()
+	r.cleanups = append(r.cleanups, fn)
+	r.cleanupMu.Unlock()
+}
+
+func (r *Runtime) runCleanups() {
+	r.cleanupMu.Lock()
+	cleanups := r.cleanups
+	r.cleanups = nil
+	r.cleanupMu.Unlock()
+
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
 }
 
 // Load executes a JavaScript file in the runtime's context.

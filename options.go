@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -71,7 +72,7 @@ type EvalOptionFunc func(*EvalOption)
 func createEvalOption(c *Context, file string, flags ...EvalOptionFunc) *EvalOption {
 	evalOption := &EvalOption{
 		c:     c,
-		file:  file,
+		file:  filepath.ToSlash(file),
 		flags: JsEvalTypeGlobal | JsEvalFlagStrict,
 	}
 

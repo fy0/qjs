@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -285,7 +286,10 @@ func TestRuntime(t *testing.T) {
 	})
 
 	t.Run("CacheDirWithInvalidPath", func(t *testing.T) {
-		_, err := qjs.New(qjs.Option{CacheDir: "/invalid/path/that/does/not/exist", DisableBuildCache: true})
+		_, err := qjs.New(qjs.Option{
+			CacheDir:          filepath.Join(t.TempDir(), "cache\x00bad"),
+			DisableBuildCache: true,
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to create compilation cache")
 	})
