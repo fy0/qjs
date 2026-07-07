@@ -83,14 +83,15 @@ type txikiRuntimeState struct {
 	cwdMu sync.RWMutex
 	cwd   string
 
-	asyncMu       sync.Mutex
-	nextAsyncID   int64
-	asyncFSJobs   map[int64]*txikiAsyncJob
-	asyncProcJobs map[int64]*txikiAsyncJob
-	nextSignalID  int64
-	signalsMu     sync.Mutex
-	signals       map[int64]*txikiSignal
-	signalEvents  []txikiSignalEvent
+	asyncMu         sync.Mutex
+	nextAsyncID     int64
+	asyncCryptoJobs map[int64]*txikiAsyncJob
+	asyncFSJobs     map[int64]*txikiAsyncJob
+	asyncProcJobs   map[int64]*txikiAsyncJob
+	nextSignalID    int64
+	signalsMu       sync.Mutex
+	signals         map[int64]*txikiSignal
+	signalEvents    []txikiSignalEvent
 }
 
 type txikiAsyncJob struct {
@@ -157,13 +158,14 @@ func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
 	}
 
 	state := &txikiRuntimeState{
-		config:        config,
-		cwd:           config.cwd,
-		net:           newTxikiNetState(),
-		workers:       newTxikiWorkerManager(),
-		signals:       make(map[int64]*txikiSignal),
-		asyncFSJobs:   make(map[int64]*txikiAsyncJob),
-		asyncProcJobs: make(map[int64]*txikiAsyncJob),
+		config:          config,
+		cwd:             config.cwd,
+		net:             newTxikiNetState(),
+		workers:         newTxikiWorkerManager(),
+		signals:         make(map[int64]*txikiSignal),
+		asyncCryptoJobs: make(map[int64]*txikiAsyncJob),
+		asyncFSJobs:     make(map[int64]*txikiAsyncJob),
+		asyncProcJobs:   make(map[int64]*txikiAsyncJob),
 	}
 
 	c.runtime.addCleanup(state.close)
@@ -340,7 +342,8 @@ func (s *txikiRuntimeState) installHostFunctions(c *Context) {
 	if s.config.hasFeature(TxikiRuntimeFeatureCrypto) {
 		c.SetFunc("__qjs_crypto_random", s.cryptoRandom)
 		c.SetFunc("__qjs_crypto_uuid", s.cryptoUUID)
-		c.SetFunc("__qjs_crypto_digest", s.cryptoDigest)
+		c.SetFunc("__qjs_crypto_digest_async_start", s.cryptoDigestAsyncStart)
+		c.SetFunc("__qjs_crypto_digest_async_poll", s.cryptoDigestAsyncPoll)
 	}
 	if s.config.hasFeature(TxikiRuntimeFeatureFetch) {
 		c.SetFunc("__qjs_fetch", s.fetch)
@@ -455,7 +458,7 @@ func (s *txikiRuntimeState) cryptoUUID(this *This) (*Value, error) {
 	return this.Context().NewString(uuid), nil
 }
 
-func (s *txikiRuntimeState) cryptoDigest(this *This) (*Value, error) {
+func (s *txikiRuntimeState) cryptoDigestAsyncStart(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 2 {
 		return nil, errors.New("crypto.subtle.digest requires algorithm and data")
@@ -467,6 +470,68 @@ func (s *txikiRuntimeState) cryptoDigest(this *This) (*Value, error) {
 		return nil, err
 	}
 
+	id := s.addAsyncCryptoJob()
+	go func() {
+		result, err := runCryptoDigest(algorithm, data)
+		s.completeAsyncCryptoJob(id, result, err)
+	}()
+
+	return this.Context().NewInt64(id), nil
+}
+
+func (s *txikiRuntimeState) cryptoDigestAsyncPoll(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("crypto digest poll requires a job id")
+	}
+
+	id := args[0].Int64()
+	s.asyncMu.Lock()
+	job, ok := s.asyncCryptoJobs[id]
+	if !ok {
+		s.asyncMu.Unlock()
+		return nil, fmt.Errorf("crypto digest job %d does not exist", id)
+	}
+	if !job.done {
+		s.asyncMu.Unlock()
+		return ToJsValue(this.Context(), map[string]any{"done": false})
+	}
+	delete(s.asyncCryptoJobs, id)
+	s.asyncMu.Unlock()
+
+	payload := map[string]any{"done": true}
+	if job.err != nil {
+		payload["error"] = job.err.Error()
+	} else {
+		payload["result"] = job.result
+	}
+
+	return ToJsValue(this.Context(), payload)
+}
+
+func (s *txikiRuntimeState) addAsyncCryptoJob() int64 {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	s.nextAsyncID++
+	id := s.nextAsyncID
+	s.asyncCryptoJobs[id] = &txikiAsyncJob{}
+
+	return id
+}
+
+func (s *txikiRuntimeState) completeAsyncCryptoJob(id int64, result any, err error) {
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+
+	if job := s.asyncCryptoJobs[id]; job != nil {
+		job.done = true
+		job.result = result
+		job.err = err
+	}
+}
+
+func runCryptoDigest(algorithm string, data []byte) ([]byte, error) {
 	var digest []byte
 	switch algorithm {
 	case "SHA-1":
@@ -482,10 +547,10 @@ func (s *txikiRuntimeState) cryptoDigest(this *This) (*Value, error) {
 		sum := sha512.Sum512(data)
 		digest = sum[:]
 	default:
-		return nil, fmt.Errorf("unsupported digest algorithm %q", args[0].String())
+		return nil, fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 
-	return this.Context().NewArrayBuffer(digest), nil
+	return digest, nil
 }
 
 func normalizeDigestAlgorithm(algorithm string) string {
@@ -2099,7 +2164,31 @@ const txikiRuntimeScript = `
     cryptoObj.subtle = cryptoObj.subtle || {};
     cryptoObj.subtle.digest = function digest(algorithm, data) {
       const name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
-      return Promise.resolve(__qjs_crypto_digest(name, toArrayBuffer(data)));
+      return new Promise((resolve, reject) => {
+        let id;
+        try {
+          id = __qjs_crypto_digest_async_start(name, toArrayBuffer(data));
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        const poll = () => {
+          let payload;
+          try {
+            payload = __qjs_crypto_digest_async_poll(id);
+          } catch (error) {
+            reject(error);
+            return;
+          }
+          if (!payload.done) {
+            setTimeout(poll, 1);
+            return;
+          }
+          if (payload.error) reject(new Error(payload.error));
+          else resolve(payload.result);
+        };
+        setTimeout(poll, 0);
+      });
     };
     define(globalThis, "crypto", cryptoObj);
   }

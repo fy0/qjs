@@ -48,7 +48,12 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 
 			const random = new Uint8Array(8);
 			crypto.getRandomValues(random);
-			const digest = await crypto.subtle.digest("SHA-256", new Uint8Array([97, 98, 99]));
+			const digestPromise = crypto.subtle.digest("SHA-256", new Uint8Array([97, 98, 99]));
+			const digestIsPromise = !!digestPromise && typeof digestPromise.then === "function";
+			let digestSettled = false;
+			digestPromise.then(() => { digestSettled = true; });
+			const digestInitiallyPending = !digestSettled;
+			const digest = await digestPromise;
 			const digestHex = Array.from(new Uint8Array(digest)).map(v => v.toString(16).padStart(2, "0")).join("");
 			const timerValue = await new Promise(resolve => setTimeout(() => resolve(42), 1));
 
@@ -58,6 +63,8 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 				isFile: stat.isFile,
 				randomLength: random.byteLength,
 				uuidLength: crypto.randomUUID().length,
+				digestIsPromise,
+				digestInitiallyPending,
 				digestHex,
 				timerValue
 			};
@@ -82,6 +89,12 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 	uuidLength := result.GetPropertyStr("uuidLength")
 	defer uuidLength.Free()
 	require.Equal(t, int32(36), uuidLength.Int32())
+	digestIsPromise := result.GetPropertyStr("digestIsPromise")
+	defer digestIsPromise.Free()
+	require.True(t, digestIsPromise.Bool())
+	digestInitiallyPending := result.GetPropertyStr("digestInitiallyPending")
+	defer digestInitiallyPending.Free()
+	require.True(t, digestInitiallyPending.Bool())
 	digestHex := result.GetPropertyStr("digestHex")
 	defer digestHex.Free()
 	require.Equal(t, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", digestHex.String())
