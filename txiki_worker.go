@@ -248,6 +248,10 @@ func (w *txikiWorker) run(ctx context.Context) {
 
 	if err := rt.InstallTxikiRuntime(TxikiRuntimeOptions{
 		CWD:         w.config.cwd,
+		Args:        w.config.args,
+		Env:         w.config.env,
+		ExecPath:    w.config.execPath,
+		Features:    w.config.features,
 		Stdout:      w.config.stdout,
 		Stderr:      w.config.stderr,
 		FetchClient: w.config.fetchClient,

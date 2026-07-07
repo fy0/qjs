@@ -13,7 +13,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -223,7 +225,7 @@ func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
 			const writePromise = qjs.fs.writeFile("dir/sub/text.txt", "hello");
 			const writeIsPromise = !!writePromise && typeof writePromise.then === "function";
 			await writePromise;
-			await qjs.writeFile("dir/sub/bytes.bin", new Uint8Array([0, 1, 255]));
+			await qjs.fs.writeFile("dir/sub/bytes.bin", new Uint8Array([0, 1, 255]));
 			await importedWriteFile("dir/sub/module.txt", "module");
 			const moduleText = await importedReadFile("dir/sub/module.txt", "utf8");
 			const nodeModuleText = await nodeReadFile("dir/sub/module.txt", "utf8");
@@ -235,9 +237,9 @@ func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
 			const readInitiallyPending = !readSettled;
 			const text = await readPromise;
 			const text2 = await qjs.fs.readFileText("dir/sub/text.txt");
-			const bytes = Array.from(new Uint8Array(await qjs.readFile("dir/sub/bytes.bin")));
-			const names = await qjs.readDir("dir/sub");
-			const fileStat = await qjs.stat("dir/sub/bytes.bin");
+			const bytes = Array.from(new Uint8Array(await qjs.fs.readFile("dir/sub/bytes.bin")));
+			const names = await qjs.fs.readdir("dir/sub");
+			const fileStat = await qjs.fs.stat("dir/sub/bytes.bin");
 			const dirStat = qjs.fs.statSync("dir");
 			const existsBefore = await qjs.fs.exists("dir/sub/text.txt");
 			const syncText = qjs.fs.readFileSync("dir/sub/sync.txt", "utf8");
@@ -254,7 +256,7 @@ func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
 				escapeError = String(error);
 			}
 
-			await qjs.remove("dir", { recursive: true });
+			await qjs.fs.remove("dir", { recursive: true });
 			return JSON.stringify({
 				text,
 				text2,
@@ -451,14 +453,30 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 	if err != nil {
 		t.Skip("go binary is not on PATH")
 	}
+	shell, shellArgs := processEnvEchoCommand(t, "QJS_PROCESS_TEST")
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
 	require.NoError(t, rt.InstallTxikiRuntime())
 
 	goBinJSON := must(json.Marshal(goBin))
+	shellJSON := must(json.Marshal(shell))
+	shellArgsJSON := must(json.Marshal(shellArgs))
 	result, err := rt.Eval("txiki-process.js", qjs.Code(`
+		import processDefault, { cwd as importedCwd, env as importedEnv } from "node:process";
+		import bareProcess from "process";
+
 		export default await (async () => {
+			const originalCwd = process.cwd();
+			await qjs.fs.mkdir("work", { recursive: true });
+			const changedCwd = process.chdir("work");
+			await qjs.fs.writeFile("cwd.txt", "cwd-ok");
+			const cwdText = await qjs.fs.readFile("cwd.txt", "utf8");
+			process.chdir("..");
+			const rootText = await qjs.fs.readFile("work/cwd.txt", "utf8");
+
+			process.env.QJS_PROCESS_TEST = 123;
+			const envResult = await process.execFile(`+string(shellJSON)+`, `+string(shellArgsJSON)+`, { timeout: 10000 });
 			const promise = process.execFile(`+string(goBinJSON)+`, ["env", "GOVERSION"], { timeout: 10000 });
 			const isPromise = !!promise && typeof promise.then === "function";
 			let settled = false;
@@ -466,26 +484,89 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 			const initiallyPending = !settled;
 			const result = await promise;
 			const syncResult = process.execFileSync(`+string(goBinJSON)+`, ["env", "GOVERSION"], { timeout: 10000 });
-			return {
+			return JSON.stringify({
+				pid: process.pid,
+				ppid: process.ppid,
+				platform: process.platform,
+				arch: process.arch,
+				argvIsFrozen: Object.isFrozen(process.argv),
+				argsIsFrozen: Object.isFrozen(process.args),
+				moduleDefaultSame: processDefault === process,
+				bareDefaultSame: bareProcess === process,
+				importedCwdSame: importedCwd === process.cwd,
+				importedEnvSame: importedEnv === process.env,
+				originalCwdIsString: typeof originalCwd === "string" && originalCwd.length > 0,
+				changedCwdEndsWithWork: /work$/.test(changedCwd.replace(/\\/g, "/")),
+				restoredCwd: process.cwd() === originalCwd,
+				cwdText,
+				rootText,
+				envEcho: envResult.stdout.trim(),
+				envStringified: process.env.QJS_PROCESS_TEST === "123",
+				killIsFunction: typeof process.kill === "function",
 				isPromise,
 				initiallyPending,
 				success: result.success,
 				stdout: result.stdout.trim(),
 				syncSuccess: syncResult.success,
 				syncStdout: syncResult.stdout.trim()
-			};
+			});
 		})();
 	`), qjs.TypeModule())
 	require.NoError(t, err)
 	defer result.Free()
 
-	jsonResult := must(result.JSONStringify())
+	jsonResult := result.String()
+	require.Contains(t, jsonResult, `"platform":"`+goruntime.GOOS+`"`)
+	require.Contains(t, jsonResult, `"arch":"`+goruntime.GOARCH+`"`)
+	require.Contains(t, jsonResult, `"argvIsFrozen":true`)
+	require.Contains(t, jsonResult, `"argsIsFrozen":true`)
+	require.Contains(t, jsonResult, `"moduleDefaultSame":true`)
+	require.Contains(t, jsonResult, `"bareDefaultSame":true`)
+	require.Contains(t, jsonResult, `"importedCwdSame":true`)
+	require.Contains(t, jsonResult, `"importedEnvSame":true`)
+	require.Contains(t, jsonResult, `"originalCwdIsString":true`)
+	require.Contains(t, jsonResult, `"changedCwdEndsWithWork":true`)
+	require.Contains(t, jsonResult, `"restoredCwd":true`)
+	require.Contains(t, jsonResult, `"cwdText":"cwd-ok"`)
+	require.Contains(t, jsonResult, `"rootText":"cwd-ok"`)
+	require.Contains(t, jsonResult, `"envEcho":"123"`)
+	require.Contains(t, jsonResult, `"envStringified":true`)
+	require.Contains(t, jsonResult, `"killIsFunction":true`)
 	require.Contains(t, jsonResult, `"isPromise":true`)
 	require.Contains(t, jsonResult, `"initiallyPending":true`)
 	require.Contains(t, jsonResult, `"success":true`)
 	require.True(t, strings.Contains(jsonResult, `"stdout":"go`), jsonResult)
 	require.Contains(t, jsonResult, `"syncSuccess":true`)
 	require.True(t, strings.Contains(jsonResult, `"syncStdout":"go`), jsonResult)
+}
+
+func TestInstallTxikiRuntimeFeatureOptions(t *testing.T) {
+	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
+	defer rt.Close()
+	require.NoError(t, rt.InstallTxikiRuntime(qjs.TxikiRuntimeOptions{
+		DisableFeatures: qjs.TxikiRuntimeFeatureProcess | qjs.TxikiRuntimeFeatureFS,
+	}))
+
+	result, err := rt.Eval("txiki-disabled-features.js", qjs.Code(`
+		export default JSON.stringify({
+			processGlobal: typeof globalThis.process,
+			qjsProcess: typeof qjs.process,
+			fs: typeof qjs.fs,
+			execHost: typeof globalThis.__qjs_exec_file,
+			fsHost: typeof globalThis.__qjs_fs_read_file,
+			fetch: typeof globalThis.fetch
+		});
+	`), qjs.TypeModule())
+	require.NoError(t, err)
+	defer result.Free()
+
+	jsonResult := result.String()
+	require.Contains(t, jsonResult, `"processGlobal":"undefined"`)
+	require.Contains(t, jsonResult, `"qjsProcess":"undefined"`)
+	require.Contains(t, jsonResult, `"fs":"undefined"`)
+	require.Contains(t, jsonResult, `"execHost":"undefined"`)
+	require.Contains(t, jsonResult, `"fsHost":"undefined"`)
+	require.Contains(t, jsonResult, `"fetch":"function"`)
 }
 
 func TestInstallTxikiRuntimeTCPClient(t *testing.T) {
@@ -879,6 +960,26 @@ func writeJSON(t *testing.T, ctx *fasthttp.RequestCtx, value any) {
 	data, err := json.Marshal(value)
 	require.NoError(t, err)
 	ctx.SetBody(data)
+}
+
+func processEnvEchoCommand(t *testing.T, name string) (string, []string) {
+	t.Helper()
+
+	if goruntime.GOOS == "windows" {
+		shell := os.Getenv("COMSPEC")
+		if shell == "" {
+			var err error
+			shell, err = exec.LookPath("cmd")
+			require.NoError(t, err)
+		}
+
+		return shell, []string{"/c", "echo %" + name + "%"}
+	}
+
+	shell, err := exec.LookPath("sh")
+	require.NoError(t, err)
+
+	return shell, []string{"-c", "printf %s \"$" + name + "\""}
 }
 
 func freeTCPPort(t *testing.T) string {

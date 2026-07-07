@@ -287,11 +287,11 @@ if err := rt.InstallTxikiRuntime(); err != nil {
 result, err := rt.Eval("app.js", qjs.Code(`
 	export default await (async () => {
 		console.log("runtime ready");
-		await qjs.writeFile("hello.txt", "hello");
+		await qjs.fs.writeFile("hello.txt", "hello");
 		const res = await fetch("https://example.com");
 		const digest = await crypto.subtle.digest("SHA-256", new Uint8Array([1, 2, 3]));
 		return {
-			file: await qjs.readFile("hello.txt", "utf8"),
+			file: await qjs.fs.readFile("hello.txt", "utf8"),
 			status: res.status,
 			digestBytes: digest.byteLength,
 		};
@@ -303,9 +303,9 @@ if err != nil {
 defer result.Free()
 ```
 
-The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, importable `fs`, `node:fs`, `fs/promises`, and `node:fs/promises` modules, `process.execFile`, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`. The `fetch` client and `qjs.http.serve()` server are backed by `github.com/valyala/fasthttp`; pass `TxikiRuntimeOptions.FetchClient` to customize the `*fasthttp.Client`.
+The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, importable `fs`, `node:fs`, `fs/promises`, and `node:fs/promises` modules, `process`, importable `process` and `node:process` modules, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`. The `fetch` client and `qjs.http.serve()` server are backed by `github.com/valyala/fasthttp`; pass `TxikiRuntimeOptions.FetchClient` to customize the `*fasthttp.Client`.
 
-Filesystem APIs follow the txiki.js-style Promise shape through `qjs.readFile`, `qjs.writeFile`, `qjs.makeDir`, `qjs.readDir`, `qjs.stat`, `qjs.remove`, and matching `qjs.fs` methods. The same API is importable from `fs/promises` and `node:fs/promises`, and is also exposed as `fs.promises` from `fs` / `node:fs`. Explicit synchronous variants are available as `qjs.fs.readFileSync`, `qjs.fs.writeFileSync`, `qjs.fs.mkdirSync`, `qjs.fs.readdirSync`, `qjs.fs.statSync`, `qjs.fs.existsSync`, `qjs.fs.removeSync`, and matching named exports from `fs`.
+Filesystem APIs follow the txiki.js-style Promise shape through `qjs.fs` methods. The same API is importable from `fs/promises` and `node:fs/promises`, and is also exposed as `fs.promises` from `fs` / `node:fs`. Explicit synchronous variants are available as `qjs.fs.readFileSync`, `qjs.fs.writeFileSync`, `qjs.fs.mkdirSync`, `qjs.fs.readdirSync`, `qjs.fs.statSync`, `qjs.fs.existsSync`, `qjs.fs.removeSync`, and matching named exports from `fs`.
 
 ```js
 import fs, { promises as fsp, readFileSync } from "node:fs";
@@ -318,7 +318,19 @@ console.log(await fsp.stat("hello.txt"));
 await rm("hello.txt");
 ```
 
-`process.execFile()` also runs asynchronously and resolves with `{ exitCode, success, stdout, stderr }`. Use `process.execFileSync()` when a blocking child-process call is intended.
+`process` provides a small txiki.js-inspired host process surface: `pid`, `ppid`, `platform`, `arch`, `argv`, `args`, `execPath`, `cwd()`, `chdir(path)`, mutable runtime-local `env`, `kill(pid, signal)`, `execFile()`, `execFileSync()`, and portable signal polling. `process.env` changes affect child process calls from this runtime but do not mutate the embedding Go process. `process.execFile()` runs asynchronously and resolves with `{ exitCode, success, stdout, stderr }`; use `process.execFileSync()` when a blocking child-process call is intended.
+
+Runtime features can be restricted at install time. A zero `Features` value keeps the default set enabled; use `DisableFeatures` to remove capabilities for sandboxed contexts.
+
+```go
+err := rt.InstallTxikiRuntime(qjs.TxikiRuntimeOptions{
+	DisableFeatures: qjs.TxikiRuntimeFeatureProcess |
+		qjs.TxikiRuntimeFeatureFS |
+		qjs.TxikiRuntimeFeatureNet |
+		qjs.TxikiRuntimeFeatureHTTP |
+		qjs.TxikiRuntimeFeatureWorker,
+})
+```
 
 ```go
 result, err := rt.Eval("net.js", qjs.Code(`

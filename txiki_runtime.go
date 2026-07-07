@@ -29,16 +29,47 @@ import (
 
 const maxCryptoRandomValues = 65536
 
+// TxikiRuntimeFeature selects optional host-backed runtime APIs.
+// A zero value in TxikiRuntimeOptions.Features keeps the default: all features enabled.
+type TxikiRuntimeFeature uint64
+
+const (
+	TxikiRuntimeFeatureCrypto TxikiRuntimeFeature = 1 << iota
+	TxikiRuntimeFeatureFetch
+	TxikiRuntimeFeatureFS
+	TxikiRuntimeFeatureProcess
+	TxikiRuntimeFeatureNet
+	TxikiRuntimeFeatureHTTP
+	TxikiRuntimeFeatureWorker
+)
+
+const TxikiRuntimeFeatureAll = TxikiRuntimeFeatureCrypto |
+	TxikiRuntimeFeatureFetch |
+	TxikiRuntimeFeatureFS |
+	TxikiRuntimeFeatureProcess |
+	TxikiRuntimeFeatureNet |
+	TxikiRuntimeFeatureHTTP |
+	TxikiRuntimeFeatureWorker
+
 // TxikiRuntimeOptions configures the optional host-backed runtime APIs inspired by txiki.js.
 type TxikiRuntimeOptions struct {
-	CWD         string
-	Stdout      io.Writer
-	Stderr      io.Writer
-	FetchClient *fasthttp.Client
+	CWD             string
+	Args            []string
+	Env             map[string]string
+	ExecPath        string
+	Features        TxikiRuntimeFeature
+	DisableFeatures TxikiRuntimeFeature
+	Stdout          io.Writer
+	Stderr          io.Writer
+	FetchClient     *fasthttp.Client
 }
 
 type txikiRuntimeConfig struct {
 	cwd         string
+	args        []string
+	env         map[string]string
+	execPath    string
+	features    TxikiRuntimeFeature
 	stdout      io.Writer
 	stderr      io.Writer
 	fetchClient *fasthttp.Client
@@ -48,6 +79,9 @@ type txikiRuntimeState struct {
 	config  txikiRuntimeConfig
 	net     *txikiNetState
 	workers *txikiWorkerManager
+
+	cwdMu sync.RWMutex
+	cwd   string
 
 	asyncMu       sync.Mutex
 	nextAsyncID   int64
@@ -117,9 +151,14 @@ func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
 		return errors.New("context is closed")
 	}
 
-	config := c.newTxikiRuntimeConfig(options...)
+	config, err := c.newTxikiRuntimeConfig(options...)
+	if err != nil {
+		return err
+	}
+
 	state := &txikiRuntimeState{
 		config:        config,
+		cwd:           config.cwd,
 		net:           newTxikiNetState(),
 		workers:       newTxikiWorkerManager(),
 		signals:       make(map[int64]*txikiSignal),
@@ -138,15 +177,20 @@ func (c *Context) InstallTxikiRuntime(options ...TxikiRuntimeOptions) error {
 		return err
 	}
 
-	return c.installTxikiRuntimeModules()
+	return c.installTxikiRuntimeModules(config)
 }
 
-func (c *Context) installTxikiRuntimeModules() error {
-	modules := map[string]string{
-		"fs":               txikiFSModuleScript,
-		"node:fs":          txikiFSModuleScript,
-		"fs/promises":      txikiFSPromisesModuleScript,
-		"node:fs/promises": txikiFSPromisesModuleScript,
+func (c *Context) installTxikiRuntimeModules(config txikiRuntimeConfig) error {
+	modules := map[string]string{}
+	if config.hasFeature(TxikiRuntimeFeatureFS) {
+		modules["fs"] = txikiFSModuleScript
+		modules["node:fs"] = txikiFSModuleScript
+		modules["fs/promises"] = txikiFSPromisesModuleScript
+		modules["node:fs/promises"] = txikiFSPromisesModuleScript
+	}
+	if config.hasFeature(TxikiRuntimeFeatureProcess) {
+		modules["process"] = txikiProcessModuleScript
+		modules["node:process"] = txikiProcessModuleScript
 	}
 
 	for name, source := range modules {
@@ -162,7 +206,7 @@ func (c *Context) installTxikiRuntimeModules() error {
 	return nil
 }
 
-func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) txikiRuntimeConfig {
+func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) (txikiRuntimeConfig, error) {
 	var option TxikiRuntimeOptions
 	if len(options) > 0 {
 		option = options[0]
@@ -184,43 +228,157 @@ func (c *Context) newTxikiRuntimeConfig(options ...TxikiRuntimeOptions) txikiRun
 		option.FetchClient = &fasthttp.Client{}
 	}
 
+	if option.Features == 0 {
+		option.Features = TxikiRuntimeFeatureAll
+	}
+	option.Features &^= option.DisableFeatures
+
+	cwd, err := filepath.Abs(option.CWD)
+	if err != nil {
+		return txikiRuntimeConfig{}, err
+	}
+
+	env := cloneStringMap(option.Env)
+	if env == nil {
+		env = environMap()
+	}
+
+	args := append([]string(nil), option.Args...)
+	if args == nil {
+		args = append([]string(nil), os.Args...)
+	}
+
+	if option.ExecPath == "" {
+		option.ExecPath, _ = os.Executable()
+	}
+
 	return txikiRuntimeConfig{
-		cwd:         option.CWD,
+		cwd:         cwd,
+		args:        args,
+		env:         env,
+		execPath:    option.ExecPath,
+		features:    option.Features,
 		stdout:      option.Stdout,
 		stderr:      option.Stderr,
 		fetchClient: option.FetchClient,
+	}, nil
+}
+
+func (c txikiRuntimeConfig) hasFeature(feature TxikiRuntimeFeature) bool {
+	return c.features&feature != 0
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	if input == nil {
+		return nil
 	}
+
+	out := make(map[string]string, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+
+	return out
+}
+
+func environMap() map[string]string {
+	env := map[string]string{}
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+
+	return env
+}
+
+func envMapToList(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, key+"="+env[key])
+	}
+
+	return result
+}
+
+func (s *txikiRuntimeState) runtimeConfigJSON(this *This) (*Value, error) {
+	config := map[string]any{
+		"features": map[string]bool{
+			"crypto":  s.config.hasFeature(TxikiRuntimeFeatureCrypto),
+			"fetch":   s.config.hasFeature(TxikiRuntimeFeatureFetch),
+			"fs":      s.config.hasFeature(TxikiRuntimeFeatureFS),
+			"process": s.config.hasFeature(TxikiRuntimeFeatureProcess),
+			"net":     s.config.hasFeature(TxikiRuntimeFeatureNet),
+			"http":    s.config.hasFeature(TxikiRuntimeFeatureHTTP),
+			"worker":  s.config.hasFeature(TxikiRuntimeFeatureWorker),
+		},
+	}
+
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewString(string(data)), nil
 }
 
 func (s *txikiRuntimeState) installHostFunctions(c *Context) {
+	c.SetFunc("__qjs_runtime_config_json", s.runtimeConfigJSON)
 	c.SetFunc("__qjs_console_print", s.consolePrint)
 	c.SetFunc("__qjs_now_unix_ms", func(this *This) (*Value, error) {
 		return this.Context().NewInt64(time.Now().UnixMilli()), nil
 	})
 	c.SetFunc("__qjs_sleep", s.sleep)
-	c.SetFunc("__qjs_crypto_random", s.cryptoRandom)
-	c.SetFunc("__qjs_crypto_uuid", s.cryptoUUID)
-	c.SetFunc("__qjs_crypto_digest", s.cryptoDigest)
-	c.SetFunc("__qjs_fetch", s.fetch)
-	c.SetFunc("__qjs_fs_read_file", s.fsReadFile)
-	c.SetFunc("__qjs_fs_read_text", s.fsReadText)
-	c.SetFunc("__qjs_fs_write_file", s.fsWriteFile)
-	c.SetFunc("__qjs_fs_mkdir", s.fsMkdir)
-	c.SetFunc("__qjs_fs_readdir", s.fsReaddir)
-	c.SetFunc("__qjs_fs_stat", s.fsStat)
-	c.SetFunc("__qjs_fs_exists", s.fsExists)
-	c.SetFunc("__qjs_fs_remove", s.fsRemove)
-	c.SetFunc("__qjs_fs_async_start", s.fsAsyncStart)
-	c.SetFunc("__qjs_fs_async_poll", s.fsAsyncPoll)
-	c.SetFunc("__qjs_process_env_json", s.processEnvJSON)
-	c.SetFunc("__qjs_exec_file", s.execFile)
-	c.SetFunc("__qjs_exec_file_async_start", s.execFileAsyncStart)
-	c.SetFunc("__qjs_exec_file_async_poll", s.execFileAsyncPoll)
-	c.SetFunc("__qjs_signal_on", s.signalOn)
-	c.SetFunc("__qjs_signal_off", s.signalOff)
-	c.SetFunc("__qjs_signal_poll", s.signalPoll)
-	s.installNetHostFunctions(c)
-	s.installWorkerHostFunctions(c)
+
+	if s.config.hasFeature(TxikiRuntimeFeatureCrypto) {
+		c.SetFunc("__qjs_crypto_random", s.cryptoRandom)
+		c.SetFunc("__qjs_crypto_uuid", s.cryptoUUID)
+		c.SetFunc("__qjs_crypto_digest", s.cryptoDigest)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureFetch) {
+		c.SetFunc("__qjs_fetch", s.fetch)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureFS) {
+		c.SetFunc("__qjs_fs_read_file", s.fsReadFile)
+		c.SetFunc("__qjs_fs_read_text", s.fsReadText)
+		c.SetFunc("__qjs_fs_write_file", s.fsWriteFile)
+		c.SetFunc("__qjs_fs_mkdir", s.fsMkdir)
+		c.SetFunc("__qjs_fs_readdir", s.fsReaddir)
+		c.SetFunc("__qjs_fs_stat", s.fsStat)
+		c.SetFunc("__qjs_fs_exists", s.fsExists)
+		c.SetFunc("__qjs_fs_remove", s.fsRemove)
+		c.SetFunc("__qjs_fs_async_start", s.fsAsyncStart)
+		c.SetFunc("__qjs_fs_async_poll", s.fsAsyncPoll)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureProcess) {
+		c.SetFunc("__qjs_process_info", s.processInfo)
+		c.SetFunc("__qjs_process_cwd", s.processCWD)
+		c.SetFunc("__qjs_process_chdir", s.processChdir)
+		c.SetFunc("__qjs_process_env_json", s.processEnvJSON)
+		c.SetFunc("__qjs_process_kill", s.processKill)
+		c.SetFunc("__qjs_exec_file", s.execFile)
+		c.SetFunc("__qjs_exec_file_async_start", s.execFileAsyncStart)
+		c.SetFunc("__qjs_exec_file_async_poll", s.execFileAsyncPoll)
+		c.SetFunc("__qjs_signal_on", s.signalOn)
+		c.SetFunc("__qjs_signal_off", s.signalOff)
+		c.SetFunc("__qjs_signal_poll", s.signalPoll)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureNet) {
+		s.installNetHostFunctions(c)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureHTTP) {
+		s.installHTTPHostFunctions(c)
+	}
+	if s.config.hasFeature(TxikiRuntimeFeatureWorker) {
+		s.installWorkerHostFunctions(c)
+	}
 }
 
 func (s *txikiRuntimeState) sleep(this *This) (*Value, error) {
@@ -802,7 +960,22 @@ func (s *txikiRuntimeState) pathArg(this *This) (string, error) {
 	return s.resolvePath(args[0].String())
 }
 
+func (s *txikiRuntimeState) currentCWD() string {
+	s.cwdMu.RLock()
+	defer s.cwdMu.RUnlock()
+
+	if s.cwd != "" {
+		return s.cwd
+	}
+
+	return s.config.cwd
+}
+
 func (s *txikiRuntimeState) resolvePath(name string) (string, error) {
+	return s.resolvePathFrom(s.currentCWD(), name)
+}
+
+func (s *txikiRuntimeState) resolvePathFrom(base, name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", errors.New("path is required")
 	}
@@ -812,14 +985,16 @@ func (s *txikiRuntimeState) resolvePath(name string) (string, error) {
 		return "", err
 	}
 
+	basePath := base
 	cleanName := filepath.Clean(filepath.FromSlash(name))
 	if filepath.IsAbs(cleanName) {
 		volume := filepath.VolumeName(cleanName)
 		cleanName = strings.TrimPrefix(cleanName, volume)
 		cleanName = strings.TrimLeft(cleanName, `\/`)
+		basePath = root
 	}
 
-	fullPath := filepath.Join(root, cleanName)
+	fullPath := filepath.Join(basePath, cleanName)
 	fullPath, err = filepath.Abs(fullPath)
 	if err != nil {
 		return "", err
@@ -837,21 +1012,95 @@ func (s *txikiRuntimeState) resolvePath(name string) (string, error) {
 	return fullPath, nil
 }
 
-func (s *txikiRuntimeState) processEnvJSON(this *This) (*Value, error) {
-	env := map[string]string{}
-	for _, item := range os.Environ() {
-		key, value, ok := strings.Cut(item, "=")
-		if ok {
-			env[key] = value
-		}
+func (s *txikiRuntimeState) chdir(path string) (string, error) {
+	next, err := s.resolvePath(path)
+	if err != nil {
+		return "", err
 	}
 
-	data, err := json.Marshal(env)
+	info, err := os.Stat(next)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", path)
+	}
+
+	s.cwdMu.Lock()
+	s.cwd = next
+	s.cwdMu.Unlock()
+
+	return next, nil
+}
+
+func (s *txikiRuntimeState) processInfo(this *This) (*Value, error) {
+	info := map[string]any{
+		"pid":      os.Getpid(),
+		"ppid":     os.Getppid(),
+		"platform": goruntime.GOOS,
+		"arch":     goruntime.GOARCH,
+		"cwd":      s.currentCWD(),
+		"execPath": s.config.execPath,
+		"argv":     append([]string(nil), s.config.args...),
+		"args":     append([]string(nil), s.config.args...),
+	}
+
+	return ToJsValue(this.Context(), info)
+}
+
+func (s *txikiRuntimeState) processCWD(this *This) (*Value, error) {
+	return this.Context().NewString(s.currentCWD()), nil
+}
+
+func (s *txikiRuntimeState) processChdir(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("chdir requires a path")
+	}
+
+	cwd, err := s.chdir(args[0].String())
+	if err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewString(cwd), nil
+}
+
+func (s *txikiRuntimeState) processEnvJSON(this *This) (*Value, error) {
+	data, err := json.Marshal(s.config.env)
 	if err != nil {
 		return nil, err
 	}
 
 	return this.Context().NewString(string(data)), nil
+}
+
+func (s *txikiRuntimeState) processKill(this *This) (*Value, error) {
+	args := this.Args()
+	if len(args) == 0 {
+		return nil, errors.New("kill requires a pid")
+	}
+
+	pid := int(args[0].Int64())
+	signalName := "SIGTERM"
+	if len(args) > 1 && !args[1].IsUndefined() && !args[1].IsNull() {
+		signalName = args[1].String()
+	}
+
+	signal, err := parseProcessSignal(signalName)
+	if err != nil {
+		return nil, err
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return nil, err
+	}
+	if err := proc.Signal(signal); err != nil {
+		return nil, err
+	}
+
+	return this.Context().NewBool(true), nil
 }
 
 func (s *txikiRuntimeState) execFile(this *This) (*Value, error) {
@@ -947,7 +1196,7 @@ func (s *txikiRuntimeState) newExecFileRequest(this *This) (execFileRequest, err
 		return execFileRequest{}, fmt.Errorf("invalid execFile args: %w", err)
 	}
 
-	cwd := s.config.cwd
+	cwd := s.currentCWD()
 	if argCWD := strings.TrimSpace(args[2].String()); argCWD != "" {
 		cwd, err = s.resolvePath(argCWD)
 		if err != nil {
@@ -955,8 +1204,9 @@ func (s *txikiRuntimeState) newExecFileRequest(this *This) (execFileRequest, err
 		}
 	}
 
-	envMap := map[string]string{}
+	envMap := cloneStringMap(s.config.env)
 	if envJSON := args[3].String(); envJSON != "" {
+		envMap = map[string]string{}
 		if err := json.Unmarshal([]byte(envJSON), &envMap); err != nil {
 			return execFileRequest{}, fmt.Errorf("invalid execFile env: %w", err)
 		}
@@ -991,7 +1241,7 @@ func (s *txikiRuntimeState) doExecFile(request execFileRequest) (map[string]any,
 
 	cmd := exec.CommandContext(execCtx, request.file, request.args...)
 	cmd.Dir = request.cwd
-	cmd.Env = mergeEnv(os.Environ(), request.env)
+	cmd.Env = envMapToList(request.env)
 	if request.input != nil {
 		cmd.Stdin = bytes.NewReader(request.input)
 	}
@@ -1035,37 +1285,6 @@ func parseJSONStringSlice(raw string) ([]string, error) {
 	err := json.Unmarshal([]byte(raw), &values)
 
 	return values, err
-}
-
-func mergeEnv(base []string, overrides map[string]string) []string {
-	if len(overrides) == 0 {
-		return base
-	}
-
-	merged := map[string]string{}
-	for _, item := range base {
-		key, value, ok := strings.Cut(item, "=")
-		if ok {
-			merged[key] = value
-		}
-	}
-
-	for key, value := range overrides {
-		merged[key] = value
-	}
-
-	keys := make([]string, 0, len(merged))
-	for key := range merged {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	result := make([]string, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, key+"="+merged[key])
-	}
-
-	return result
 }
 
 func (s *txikiRuntimeState) signalOn(this *This) (*Value, error) {
@@ -1137,6 +1356,19 @@ func parsePortableSignal(name string) (os.Signal, string, error) {
 		return os.Interrupt, "SIGINT", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported portable signal %q", name)
+	}
+}
+
+func parseProcessSignal(name string) (os.Signal, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(name))
+	normalized = strings.TrimPrefix(normalized, "SIG")
+	switch normalized {
+	case "", "TERM", "KILL":
+		return os.Kill, nil
+	case "INT", "INTERRUPT":
+		return os.Interrupt, nil
+	default:
+		return nil, fmt.Errorf("unsupported signal %q", name)
 	}
 }
 
@@ -1227,6 +1459,8 @@ const txikiRuntimeScript = `
 
   const qjs = globalThis.qjs && typeof globalThis.qjs === "object" ? globalThis.qjs : {};
   define(globalThis, "qjs", qjs);
+  const runtimeConfig = JSON.parse(__qjs_runtime_config_json());
+  const feature = name => !!(runtimeConfig.features && runtimeConfig.features[name]);
   if (typeof globalThis.self === "undefined") define(globalThis, "self", globalThis);
   const nativeSetTimeout = globalThis.setTimeout;
   const nativeClearTimeout = globalThis.clearTimeout;
@@ -1850,23 +2084,25 @@ const txikiRuntimeScript = `
     if (typeof nativeClearInterval === "function") define(globalThis, "clearInterval", nativeClearInterval);
   }
 
-  const cryptoObj = globalThis.crypto && typeof globalThis.crypto === "object" ? globalThis.crypto : {};
-  cryptoObj.getRandomValues = function getRandomValues(target) {
-    if (!ArrayBuffer.isView(target)) throw new TypeError("Expected an integer TypedArray");
-    if (target.byteLength > 65536) throw new Error("QuotaExceededError");
-    const random = new Uint8Array(__qjs_crypto_random(target.byteLength));
-    new Uint8Array(target.buffer, target.byteOffset, target.byteLength).set(random);
-    return target;
-  };
-  cryptoObj.randomUUID = function randomUUID() {
-    return __qjs_crypto_uuid();
-  };
-  cryptoObj.subtle = cryptoObj.subtle || {};
-  cryptoObj.subtle.digest = function digest(algorithm, data) {
-    const name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
-    return Promise.resolve(__qjs_crypto_digest(name, toArrayBuffer(data)));
-  };
-  define(globalThis, "crypto", cryptoObj);
+  if (feature("crypto")) {
+    const cryptoObj = globalThis.crypto && typeof globalThis.crypto === "object" ? globalThis.crypto : {};
+    cryptoObj.getRandomValues = function getRandomValues(target) {
+      if (!ArrayBuffer.isView(target)) throw new TypeError("Expected an integer TypedArray");
+      if (target.byteLength > 65536) throw new Error("QuotaExceededError");
+      const random = new Uint8Array(__qjs_crypto_random(target.byteLength));
+      new Uint8Array(target.buffer, target.byteOffset, target.byteLength).set(random);
+      return target;
+    };
+    cryptoObj.randomUUID = function randomUUID() {
+      return __qjs_crypto_uuid();
+    };
+    cryptoObj.subtle = cryptoObj.subtle || {};
+    cryptoObj.subtle.digest = function digest(algorithm, data) {
+      const name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
+      return Promise.resolve(__qjs_crypto_digest(name, toArrayBuffer(data)));
+    };
+    define(globalThis, "crypto", cryptoObj);
+  }
 
   class Headers {
     constructor(init) {
@@ -1991,92 +2227,91 @@ const txikiRuntimeScript = `
   }
   define(globalThis, "Response", Response);
 
-  define(globalThis, "fetch", function fetch(input, init = {}) {
-    let request;
-    try {
-      request = input instanceof Request && Object.keys(init || {}).length === 0 ? input : new Request(input, init);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    if (request.signal && request.signal.aborted) return Promise.reject(request.signal.reason || new DOMException("This operation was aborted", "AbortError"));
-    return Promise.resolve(__qjs_fetch(request.url, request.method, JSON.stringify(headersToObject(request.headers)), request._body)).then(payload => new Response(payload));
-  });
-
-  function fsAsync(op, path, options, data) {
-    const encoding = typeof options === "string" ? options : options && options.encoding ? options.encoding : "";
-    const recursive = !!(options && typeof options === "object" && options.recursive);
-    return new Promise((resolve, reject) => {
-      let id;
+  if (feature("fetch")) {
+    define(globalThis, "fetch", function fetch(input, init = {}) {
+      let request;
       try {
-        id = __qjs_fs_async_start(String(op), String(path), String(encoding || ""), recursive, data === undefined ? null : data);
+        request = input instanceof Request && Object.keys(init || {}).length === 0 ? input : new Request(input, init);
       } catch (error) {
-        reject(error);
-        return;
+        return Promise.reject(error);
       }
-      const poll = () => {
-        let payload;
+      if (request.signal && request.signal.aborted) return Promise.reject(request.signal.reason || new DOMException("This operation was aborted", "AbortError"));
+      return Promise.resolve(__qjs_fetch(request.url, request.method, JSON.stringify(headersToObject(request.headers)), request._body)).then(payload => new Response(payload));
+    });
+  }
+
+  if (feature("fs")) {
+    function fsAsync(op, path, options, data) {
+      const encoding = typeof options === "string" ? options : options && options.encoding ? options.encoding : "";
+      const recursive = !!(options && typeof options === "object" && options.recursive);
+      return new Promise((resolve, reject) => {
+        let id;
         try {
-          payload = __qjs_fs_async_poll(id);
+          id = __qjs_fs_async_start(String(op), String(path), String(encoding || ""), recursive, data === undefined ? null : data);
         } catch (error) {
           reject(error);
           return;
         }
-        if (!payload.done) {
-          setTimeout(poll, 1);
-          return;
-        }
-        if (payload.error) reject(new Error(payload.error));
-        else resolve(payload.result);
-      };
-      setTimeout(poll, 0);
-    });
-  }
+        const poll = () => {
+          let payload;
+          try {
+            payload = __qjs_fs_async_poll(id);
+          } catch (error) {
+            reject(error);
+            return;
+          }
+          if (!payload.done) {
+            setTimeout(poll, 1);
+            return;
+          }
+          if (payload.error) reject(new Error(payload.error));
+          else resolve(payload.result);
+        };
+        setTimeout(poll, 0);
+      });
+    }
 
-  const fs = qjs.fs || {};
-  fs.readFileSync = function readFileSync(path, options) {
-    const encoding = typeof options === "string" ? options : options && options.encoding;
-    return encoding ? __qjs_fs_read_text(String(path), String(encoding)) : __qjs_fs_read_file(String(path));
-  };
-  fs.readFileTextSync = path => __qjs_fs_read_text(String(path), "utf8");
-  fs.writeFileSync = (path, data) => __qjs_fs_write_file(String(path), data);
-  fs.mkdirSync = (path, options = {}) => __qjs_fs_mkdir(String(path), !!options.recursive);
-  fs.readdirSync = path => __qjs_fs_readdir(String(path || "."));
-  fs.statSync = path => __qjs_fs_stat(String(path));
-  fs.existsSync = path => __qjs_fs_exists(String(path));
-  fs.removeSync = (path, options = {}) => __qjs_fs_remove(String(path), !!options.recursive);
-  fs.readFile = (path, options) => fsAsync("readFile", path, options);
-  fs.readFileText = path => fsAsync("readFile", path, "utf8");
-  fs.writeFile = (path, data, options = {}) => fsAsync("writeFile", path, options, data);
-  fs.mkdir = (path, options = {}) => fsAsync("mkdir", path, options);
-  fs.readdir = path => fsAsync("readdir", path || ".", {});
-  fs.stat = path => fsAsync("stat", path, {});
-  fs.exists = path => fsAsync("exists", path, {});
-  fs.remove = (path, options = {}) => fsAsync("remove", path, options);
-  fs.rm = fs.remove;
-  fs.rmSync = fs.removeSync;
-  fs.readDir = fs.readdir;
-  fs.makeDir = fs.mkdir;
-  const fsPromises = fs.promises || {};
-  fsPromises.readFile = fs.readFile;
-  fsPromises.readFileText = fs.readFileText;
-  fsPromises.writeFile = fs.writeFile;
-  fsPromises.mkdir = fs.mkdir;
-  fsPromises.readdir = fs.readdir;
-  fsPromises.readDir = fs.readdir;
-  fsPromises.stat = fs.stat;
-  fsPromises.exists = fs.exists;
-  fsPromises.remove = fs.remove;
-  fsPromises.rm = fs.remove;
-  define(fs, "promises", fsPromises, true);
-  define(qjs, "fs", fs, true);
-  define(qjs, "readFile", fs.readFile, true);
-  define(qjs, "writeFile", fs.writeFile, true);
-  define(qjs, "makeDir", fs.mkdir, true);
-  define(qjs, "readDir", fs.readdir, true);
-  define(qjs, "stat", fs.stat, true);
-  define(qjs, "remove", fs.remove, true);
+    const fs = qjs.fs || {};
+    fs.readFileSync = function readFileSync(path, options) {
+      const encoding = typeof options === "string" ? options : options && options.encoding;
+      return encoding ? __qjs_fs_read_text(String(path), String(encoding)) : __qjs_fs_read_file(String(path));
+    };
+    fs.readFileTextSync = path => __qjs_fs_read_text(String(path), "utf8");
+    fs.writeFileSync = (path, data) => __qjs_fs_write_file(String(path), data);
+    fs.mkdirSync = (path, options = {}) => __qjs_fs_mkdir(String(path), !!options.recursive);
+    fs.readdirSync = path => __qjs_fs_readdir(String(path || "."));
+    fs.statSync = path => __qjs_fs_stat(String(path));
+    fs.existsSync = path => __qjs_fs_exists(String(path));
+    fs.removeSync = (path, options = {}) => __qjs_fs_remove(String(path), !!options.recursive);
+    fs.readFile = (path, options) => fsAsync("readFile", path, options);
+    fs.readFileText = path => fsAsync("readFile", path, "utf8");
+    fs.writeFile = (path, data, options = {}) => fsAsync("writeFile", path, options, data);
+    fs.mkdir = (path, options = {}) => fsAsync("mkdir", path, options);
+    fs.readdir = path => fsAsync("readdir", path || ".", {});
+    fs.stat = path => fsAsync("stat", path, {});
+    fs.exists = path => fsAsync("exists", path, {});
+    fs.remove = (path, options = {}) => fsAsync("remove", path, options);
+    fs.rm = fs.remove;
+    fs.rmSync = fs.removeSync;
+    fs.readDir = fs.readdir;
+    fs.makeDir = fs.mkdir;
+    const fsPromises = fs.promises || {};
+    fsPromises.readFile = fs.readFile;
+    fsPromises.readFileText = fs.readFileText;
+    fsPromises.writeFile = fs.writeFile;
+    fsPromises.mkdir = fs.mkdir;
+    fsPromises.readdir = fs.readdir;
+    fsPromises.readDir = fs.readdir;
+    fsPromises.stat = fs.stat;
+    fsPromises.exists = fs.exists;
+    fsPromises.remove = fs.remove;
+    fsPromises.rm = fs.remove;
+    define(fs, "promises", fsPromises, true);
+    define(qjs, "fs", fs, true);
+  }
   if (typeof globalThis.tjs === "undefined") define(globalThis, "tjs", qjs);
 
+  if (feature("net")) {
   class TCPSocket {
     constructor(remoteAddress, remotePort, options = {}, acceptedInfo) {
       this._init(acceptedInfo || __qjs_tcp_connect(String(remoteAddress), Number(remotePort), Number(options.timeout || 0)));
@@ -2219,7 +2454,9 @@ const txikiRuntimeScript = `
   define(globalThis, "UDPSocket", UDPSocket);
   define(globalThis, "PipeSocket", PipeSocket);
   define(globalThis, "PipeServerSocket", PipeServerSocket);
+  }
 
+  if (feature("http")) {
   class HostWebSocket extends EventTarget {
     constructor() {
       super();
@@ -2341,127 +2578,169 @@ const txikiRuntimeScript = `
   define(qjs, "http", httpRuntime, true);
   define(qjs, "serve", httpRuntime.serve, true);
   define(globalThis, "WebSocket", WebSocket);
-
-  function serializeWorkerMessage(value) {
-    const raw = JSON.stringify(value);
-    return raw === undefined ? "null" : raw;
   }
 
-  function parseWorkerMessage(raw) {
-    try {
-      return JSON.parse(raw);
-    } catch (_) {
-      return raw;
+  if (feature("worker")) {
+    function serializeWorkerMessage(value) {
+      const raw = JSON.stringify(value);
+      return raw === undefined ? "null" : raw;
     }
-  }
 
-  class Worker extends EventTarget {
-    constructor(source, options = {}) {
-      super();
-      this._id = __qjs_worker_create(String(source), JSON.stringify(options || {}));
-      this.onmessage = null;
-      this.onerror = null;
-    }
-    postMessage(value) {
-      return __qjs_worker_post(this._id, serializeWorkerMessage(value));
-    }
-    pollMessages() {
-      const messages = __qjs_worker_poll(this._id);
-      for (const raw of messages) {
-        this.dispatchEvent(new MessageEvent("message", {
-          data: parseWorkerMessage(raw),
-          target: this,
-          currentTarget: this
-        }));
-      }
-
-      const err = __qjs_worker_error(this._id);
-      if (err) {
-        this.dispatchEvent(new ErrorEvent("error", {
-          message: err,
-          error: new Error(err),
-          target: this,
-          currentTarget: this
-        }));
-      }
-
-      return messages.length;
-    }
-    terminate() {
-      if (this._id) __qjs_worker_terminate(this._id);
-      this._id = 0;
-    }
-  }
-
-  define(globalThis, "Worker", Worker);
-
-  const processObj = qjs.process || {};
-  processObj.pid = 0;
-  processObj.platform = "` + goruntime.GOOS + `";
-  processObj.arch = "` + goruntime.GOARCH + `";
-  processObj.cwd = () => ".";
-  processObj.env = JSON.parse(__qjs_process_env_json());
-  function execFileArgs(file, args = [], options = {}) {
-    const input = options.input == null ? null : toArrayBuffer(options.input);
-    return [
-      String(file),
-      JSON.stringify(args.map(String)),
-      options.cwd ? String(options.cwd) : "",
-      JSON.stringify(options.env || {}),
-      input,
-      Number(options.timeout || 0)
-    ];
-  }
-  function pollAsyncJob(pollFn, id, resolve, reject) {
-    let payload;
-    try {
-      payload = pollFn(id);
-    } catch (error) {
-      reject(error);
-      return;
-    }
-    if (!payload.done) {
-      setTimeout(() => pollAsyncJob(pollFn, id, resolve, reject), 1);
-      return;
-    }
-    if (payload.error) reject(new Error(payload.error));
-    else resolve(payload.result);
-  }
-  processObj.execFileSync = function execFileSync(file, args = [], options = {}) {
-    return __qjs_exec_file(...execFileArgs(file, args, options));
-  };
-  processObj.execFile = function execFile(file, args = [], options = {}) {
-    return new Promise((resolve, reject) => {
-      let id;
+    function parseWorkerMessage(raw) {
       try {
-        id = __qjs_exec_file_async_start(...execFileArgs(file, args, options));
+        return JSON.parse(raw);
+      } catch (_) {
+        return raw;
+      }
+    }
+
+    class Worker extends EventTarget {
+      constructor(source, options = {}) {
+        super();
+        this._id = __qjs_worker_create(String(source), JSON.stringify(options || {}));
+        this.onmessage = null;
+        this.onerror = null;
+      }
+      postMessage(value) {
+        return __qjs_worker_post(this._id, serializeWorkerMessage(value));
+      }
+      pollMessages() {
+        const messages = __qjs_worker_poll(this._id);
+        for (const raw of messages) {
+          this.dispatchEvent(new MessageEvent("message", {
+            data: parseWorkerMessage(raw),
+            target: this,
+            currentTarget: this
+          }));
+        }
+
+        const err = __qjs_worker_error(this._id);
+        if (err) {
+          this.dispatchEvent(new ErrorEvent("error", {
+            message: err,
+            error: new Error(err),
+            target: this,
+            currentTarget: this
+          }));
+        }
+
+        return messages.length;
+      }
+      terminate() {
+        if (this._id) __qjs_worker_terminate(this._id);
+        this._id = 0;
+      }
+    }
+
+    define(globalThis, "Worker", Worker);
+  }
+
+  if (feature("process")) {
+    const processObj = qjs.process || {};
+    const processInfo = __qjs_process_info();
+    processObj.pid = processInfo.pid;
+    processObj.ppid = processInfo.ppid;
+    processObj.platform = processInfo.platform;
+    processObj.arch = processInfo.arch;
+    processObj.execPath = processInfo.execPath || "";
+    processObj.argv = Object.freeze((processInfo.argv || []).slice());
+    processObj.args = Object.freeze((processInfo.args || []).slice());
+    processObj.cwd = () => __qjs_process_cwd();
+    processObj.chdir = path => __qjs_process_chdir(String(path));
+    processObj.kill = (pid, signal = "SIGTERM") => __qjs_process_kill(Number(pid), String(signal));
+    processObj.exitCode = 0;
+
+    const envTarget = JSON.parse(__qjs_process_env_json());
+    processObj.env = new Proxy(envTarget, {
+      get(target, prop) {
+        if (prop === Symbol.toStringTag) return "process.env";
+        if (prop === "toJSON") return () => ({ ...target });
+        if (typeof prop === "string") return target[prop];
+        return undefined;
+      },
+      set(target, prop, value) {
+        if (typeof prop !== "string") return false;
+        target[prop] = String(value);
+        return true;
+      },
+      deleteProperty(target, prop) {
+        if (typeof prop === "string") delete target[prop];
+        return true;
+      },
+      ownKeys(target) {
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        if (Object.prototype.hasOwnProperty.call(target, prop)) {
+          return { configurable: true, enumerable: true, writable: true, value: target[prop] };
+        }
+        return undefined;
+      }
+    });
+
+    function execFileArgs(file, args = [], options = {}) {
+      const input = options.input == null ? null : toArrayBuffer(options.input);
+      const env = Object.prototype.hasOwnProperty.call(options, "env") ? options.env : processObj.env;
+      return [
+        String(file),
+        JSON.stringify(args.map(String)),
+        options.cwd ? String(options.cwd) : "",
+        JSON.stringify(env || {}),
+        input,
+        Number(options.timeout || 0)
+      ];
+    }
+    function pollAsyncJob(pollFn, id, resolve, reject) {
+      let payload;
+      try {
+        payload = pollFn(id);
       } catch (error) {
         reject(error);
         return;
       }
-      setTimeout(() => pollAsyncJob(__qjs_exec_file_async_poll, id, resolve, reject), 0);
-    });
-  };
-  const signalCallbacks = new Map();
-  processObj.onSignal = function onSignal(signalName, callback) {
-    if (typeof callback !== "function") throw new TypeError("signal callback must be a function");
-    const id = __qjs_signal_on(String(signalName));
-    signalCallbacks.set(id, callback);
-    return () => {
-      signalCallbacks.delete(id);
-      __qjs_signal_off(id);
-    };
-  };
-  processObj.pollSignals = function pollSignals() {
-    const events = __qjs_signal_poll();
-    for (const event of events) {
-      const callback = signalCallbacks.get(event.id);
-      if (callback) callback(event.signal);
+      if (!payload.done) {
+        setTimeout(() => pollAsyncJob(pollFn, id, resolve, reject), 1);
+        return;
+      }
+      if (payload.error) reject(new Error(payload.error));
+      else resolve(payload.result);
     }
-    return events.length;
-  };
-  define(qjs, "process", processObj, true);
-  define(globalThis, "process", processObj);
+    processObj.execFileSync = function execFileSync(file, args = [], options = {}) {
+      return __qjs_exec_file(...execFileArgs(file, args, options));
+    };
+    processObj.execFile = function execFile(file, args = [], options = {}) {
+      return new Promise((resolve, reject) => {
+        let id;
+        try {
+          id = __qjs_exec_file_async_start(...execFileArgs(file, args, options));
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        setTimeout(() => pollAsyncJob(__qjs_exec_file_async_poll, id, resolve, reject), 0);
+      });
+    };
+    const signalCallbacks = new Map();
+    processObj.onSignal = function onSignal(signalName, callback) {
+      if (typeof callback !== "function") throw new TypeError("signal callback must be a function");
+      const id = __qjs_signal_on(String(signalName));
+      signalCallbacks.set(id, callback);
+      return () => {
+        signalCallbacks.delete(id);
+        __qjs_signal_off(id);
+      };
+    };
+    processObj.pollSignals = function pollSignals() {
+      const events = __qjs_signal_poll();
+      for (const event of events) {
+        const callback = signalCallbacks.get(event.id);
+        if (callback) callback(event.signal);
+      }
+      return events.length;
+    };
+    define(qjs, "process", processObj, true);
+    define(globalThis, "process", processObj);
+  }
 })();
 `
 
@@ -2544,4 +2823,42 @@ export {
   rm
 };
 export default promises;
+`
+
+const txikiProcessModuleScript = `
+const process = globalThis.qjs && globalThis.qjs.process;
+if (!process) throw new Error("qjs process runtime is not installed");
+const pid = process.pid;
+const ppid = process.ppid;
+const platform = process.platform;
+const arch = process.arch;
+const execPath = process.execPath;
+const argv = process.argv;
+const args = process.args;
+const env = process.env;
+const cwd = process.cwd;
+const chdir = process.chdir;
+const kill = process.kill;
+const execFile = process.execFile;
+const execFileSync = process.execFileSync;
+const onSignal = process.onSignal;
+const pollSignals = process.pollSignals;
+export {
+  pid,
+  ppid,
+  platform,
+  arch,
+  execPath,
+  argv,
+  args,
+  env,
+  cwd,
+  chdir,
+  kill,
+  execFile,
+  execFileSync,
+  onSignal,
+  pollSignals
+};
+export default process;
 `

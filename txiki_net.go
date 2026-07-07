@@ -51,7 +51,6 @@ func (s *txikiRuntimeState) installNetHostFunctions(c *Context) {
 	c.SetFunc("__qjs_unix_listen", s.unixListen)
 	c.SetFunc("__qjs_unix_connect", s.unixConnect)
 	c.SetFunc("__qjs_unix_accept", s.tcpAccept)
-	s.installHTTPHostFunctions(c)
 }
 
 func (n *txikiNetState) close() {
