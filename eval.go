@@ -29,8 +29,14 @@ func eval(c *Context, file string, flags ...EvalOptionFunc) (*Value, error) {
 	defer option.Free()
 
 	result := c.Call("QJS_Eval", c.Raw(), evalOptions)
-
-	return normalizeJsValue(c, result)
+	value, err := normalizeJsValue(c, result)
+	if code, requested := c.runtime.consumeProcessExit(); requested {
+		if value != nil {
+			value.Free()
+		}
+		return nil, &ProcessExitError{Code: code}
+	}
+	return value, err
 }
 
 func compile(c *Context, file string, flags ...EvalOptionFunc) (_ []byte, err error) {

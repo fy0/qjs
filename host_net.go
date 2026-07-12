@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-type txikiNetState struct {
+type hostNetState struct {
 	mu sync.Mutex
 
 	nextID       int64
@@ -20,24 +20,24 @@ type txikiNetState struct {
 	streams      map[int64]net.Conn
 	udpSockets   map[int64]*net.UDPConn
 	ownedUnix    map[int64]string
-	httpServers  map[int64]*txikiHTTPServer
-	httpRequests map[int64]*txikiHTTPRequest
-	webSockets   map[int64]*txikiWebSocketConn
+	httpServers  map[int64]*hostHTTPServer
+	httpRequests map[int64]*hostHTTPRequest
+	webSockets   map[int64]*hostWebSocketConn
 }
 
-func newTxikiNetState() *txikiNetState {
-	return &txikiNetState{
+func newHostNetState() *hostNetState {
+	return &hostNetState{
 		listeners:    map[int64]net.Listener{},
 		streams:      map[int64]net.Conn{},
 		udpSockets:   map[int64]*net.UDPConn{},
 		ownedUnix:    map[int64]string{},
-		httpServers:  map[int64]*txikiHTTPServer{},
-		httpRequests: map[int64]*txikiHTTPRequest{},
-		webSockets:   map[int64]*txikiWebSocketConn{},
+		httpServers:  map[int64]*hostHTTPServer{},
+		httpRequests: map[int64]*hostHTTPRequest{},
+		webSockets:   map[int64]*hostWebSocketConn{},
 	}
 }
 
-func (s *txikiRuntimeState) installNetHostFunctions(c *Context) {
+func (s *hostRuntimeState) installNetHostFunctions(c *Context) {
 	c.SetFunc("__qjs_tcp_listen", s.tcpListen)
 	c.SetFunc("__qjs_tcp_accept", s.tcpAccept)
 	c.SetFunc("__qjs_tcp_connect", s.tcpConnect)
@@ -53,7 +53,7 @@ func (s *txikiRuntimeState) installNetHostFunctions(c *Context) {
 	c.SetFunc("__qjs_unix_accept", s.tcpAccept)
 }
 
-func (n *txikiNetState) close() {
+func (n *hostNetState) close() {
 	n.mu.Lock()
 	listeners := n.listeners
 	streams := n.streams
@@ -65,9 +65,9 @@ func (n *txikiNetState) close() {
 	n.streams = map[int64]net.Conn{}
 	n.udpSockets = map[int64]*net.UDPConn{}
 	n.ownedUnix = map[int64]string{}
-	n.httpServers = map[int64]*txikiHTTPServer{}
-	n.httpRequests = map[int64]*txikiHTTPRequest{}
-	n.webSockets = map[int64]*txikiWebSocketConn{}
+	n.httpServers = map[int64]*hostHTTPServer{}
+	n.httpRequests = map[int64]*hostHTTPRequest{}
+	n.webSockets = map[int64]*hostWebSocketConn{}
 	n.mu.Unlock()
 
 	for _, server := range httpServers {
@@ -90,12 +90,12 @@ func (n *txikiNetState) close() {
 	}
 }
 
-func (n *txikiNetState) nextResourceIDLocked() int64 {
+func (n *hostNetState) nextResourceIDLocked() int64 {
 	n.nextID++
 	return n.nextID
 }
 
-func (n *txikiNetState) addListener(listener net.Listener) int64 {
+func (n *hostNetState) addListener(listener net.Listener) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -105,7 +105,7 @@ func (n *txikiNetState) addListener(listener net.Listener) int64 {
 	return id
 }
 
-func (n *txikiNetState) addStream(conn net.Conn) int64 {
+func (n *hostNetState) addStream(conn net.Conn) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -115,7 +115,7 @@ func (n *txikiNetState) addStream(conn net.Conn) int64 {
 	return id
 }
 
-func (n *txikiNetState) addUDPSocket(conn *net.UDPConn) int64 {
+func (n *hostNetState) addUDPSocket(conn *net.UDPConn) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -125,7 +125,7 @@ func (n *txikiNetState) addUDPSocket(conn *net.UDPConn) int64 {
 	return id
 }
 
-func (n *txikiNetState) listener(id int64) (net.Listener, error) {
+func (n *hostNetState) listener(id int64) (net.Listener, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -137,7 +137,7 @@ func (n *txikiNetState) listener(id int64) (net.Listener, error) {
 	return listener, nil
 }
 
-func (n *txikiNetState) stream(id int64) (net.Conn, error) {
+func (n *hostNetState) stream(id int64) (net.Conn, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -149,7 +149,7 @@ func (n *txikiNetState) stream(id int64) (net.Conn, error) {
 	return conn, nil
 }
 
-func (n *txikiNetState) udpSocket(id int64) (*net.UDPConn, error) {
+func (n *hostNetState) udpSocket(id int64) (*net.UDPConn, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -161,7 +161,7 @@ func (n *txikiNetState) udpSocket(id int64) (*net.UDPConn, error) {
 	return conn, nil
 }
 
-func (n *txikiNetState) closeListener(id int64) error {
+func (n *hostNetState) closeListener(id int64) error {
 	n.mu.Lock()
 	listener := n.listeners[id]
 	delete(n.listeners, id)
@@ -181,7 +181,7 @@ func (n *txikiNetState) closeListener(id int64) error {
 	return err
 }
 
-func (n *txikiNetState) closeStream(id int64) error {
+func (n *hostNetState) closeStream(id int64) error {
 	n.mu.Lock()
 	conn := n.streams[id]
 	delete(n.streams, id)
@@ -194,7 +194,7 @@ func (n *txikiNetState) closeStream(id int64) error {
 	return conn.Close()
 }
 
-func (n *txikiNetState) closeUDPSocket(id int64) error {
+func (n *hostNetState) closeUDPSocket(id int64) error {
 	n.mu.Lock()
 	conn := n.udpSockets[id]
 	delete(n.udpSockets, id)
@@ -207,7 +207,7 @@ func (n *txikiNetState) closeUDPSocket(id int64) error {
 	return conn.Close()
 }
 
-func (s *txikiRuntimeState) tcpListen(this *This) (*Value, error) {
+func (s *hostRuntimeState) tcpListen(this *This) (*Value, error) {
 	args := this.Args()
 	host := "127.0.0.1"
 	if len(args) > 0 && stringsTrim(args[0].String()) != "" {
@@ -234,7 +234,7 @@ func (s *txikiRuntimeState) tcpListen(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) tcpAccept(this *This) (*Value, error) {
+func (s *hostRuntimeState) tcpAccept(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("accept requires a listener id")
@@ -263,7 +263,7 @@ func (s *txikiRuntimeState) tcpAccept(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) tcpConnect(this *This) (*Value, error) {
+func (s *hostRuntimeState) tcpConnect(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 2 {
 		return nil, errors.New("connect requires host and port")
@@ -294,7 +294,7 @@ func (s *txikiRuntimeState) tcpConnect(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) streamRead(this *This) (*Value, error) {
+func (s *hostRuntimeState) streamRead(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("read requires a stream id")
@@ -326,7 +326,7 @@ func (s *txikiRuntimeState) streamRead(this *This) (*Value, error) {
 	return this.Context().NewArrayBuffer(buf[:n]), nil
 }
 
-func (s *txikiRuntimeState) streamWrite(this *This) (*Value, error) {
+func (s *hostRuntimeState) streamWrite(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 2 {
 		return nil, errors.New("write requires a stream id and data")
@@ -350,7 +350,7 @@ func (s *txikiRuntimeState) streamWrite(this *This) (*Value, error) {
 	return this.Context().NewInt64(int64(n)), nil
 }
 
-func (s *txikiRuntimeState) streamClose(this *This) (*Value, error) {
+func (s *hostRuntimeState) streamClose(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -367,7 +367,7 @@ func (s *txikiRuntimeState) streamClose(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (s *txikiRuntimeState) udpBind(this *This) (*Value, error) {
+func (s *hostRuntimeState) udpBind(this *This) (*Value, error) {
 	args := this.Args()
 	host := "127.0.0.1"
 	if len(args) > 0 && stringsTrim(args[0].String()) != "" {
@@ -399,7 +399,7 @@ func (s *txikiRuntimeState) udpBind(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) udpSend(this *This) (*Value, error) {
+func (s *hostRuntimeState) udpSend(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 4 {
 		return nil, errors.New("udp send requires socket id, data, host, and port")
@@ -428,7 +428,7 @@ func (s *txikiRuntimeState) udpSend(this *This) (*Value, error) {
 	return this.Context().NewInt64(int64(n)), nil
 }
 
-func (s *txikiRuntimeState) udpReceive(this *This) (*Value, error) {
+func (s *hostRuntimeState) udpReceive(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("udp receive requires a socket id")
@@ -457,7 +457,7 @@ func (s *txikiRuntimeState) udpReceive(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) udpClose(this *This) (*Value, error) {
+func (s *hostRuntimeState) udpClose(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -470,7 +470,7 @@ func (s *txikiRuntimeState) udpClose(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (s *txikiRuntimeState) unixListen(this *This) (*Value, error) {
+func (s *hostRuntimeState) unixListen(this *This) (*Value, error) {
 	if runtime.GOOS == "windows" {
 		return nil, errors.New("unix sockets are not supported on windows")
 	}
@@ -502,7 +502,7 @@ func (s *txikiRuntimeState) unixListen(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) unixConnect(this *This) (*Value, error) {
+func (s *hostRuntimeState) unixConnect(this *This) (*Value, error) {
 	if runtime.GOOS == "windows" {
 		return nil, errors.New("unix sockets are not supported on windows")
 	}

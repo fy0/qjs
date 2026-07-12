@@ -35,9 +35,23 @@ type Runtime struct {
 	context  *Context
 	registry *ProxyRegistry
 
-	cleanupMu sync.Mutex
-	cleanups  []func()
+	cleanupMu     sync.Mutex
+	cleanups      []func()
+	closeOnce     sync.Once
+	hostMu        sync.Mutex
+	hostState     hostInstallState
+	exitMu        sync.Mutex
+	exitRequested bool
+	exitCode      int
 }
+
+type hostInstallState uint8
+
+const (
+	hostNotInstalled hostInstallState = iota
+	hostInstalling
+	hostInstalled
+)
 
 func createGlobalCompiledModule(
 	ctx context.Context,
@@ -189,6 +203,10 @@ func (r *Runtime) Close() {
 	if r == nil {
 		return
 	}
+	r.closeOnce.Do(r.close)
+}
+
+func (r *Runtime) close() {
 
 	r.runCleanups()
 
@@ -218,6 +236,50 @@ func (r *Runtime) Close() {
 	r.malloc = nil
 	r.free = nil
 	r.mem = nil
+}
+
+func (r *Runtime) beginHostInstall() error {
+	r.hostMu.Lock()
+	defer r.hostMu.Unlock()
+
+	if r.hostState != hostNotInstalled {
+		return errors.New("host runtime is already installed")
+	}
+	r.hostState = hostInstalling
+
+	return nil
+}
+
+func (r *Runtime) finishHostInstall() {
+	r.hostMu.Lock()
+	r.hostState = hostInstalled
+	r.hostMu.Unlock()
+}
+
+func (r *Runtime) abortHostInstall() {
+	r.hostMu.Lock()
+	if r.hostState == hostInstalling {
+		r.hostState = hostNotInstalled
+	}
+	r.hostMu.Unlock()
+}
+
+func (r *Runtime) requestProcessExit(code int) {
+	r.exitMu.Lock()
+	r.exitRequested = true
+	r.exitCode = code
+	r.exitMu.Unlock()
+}
+
+func (r *Runtime) consumeProcessExit() (int, bool) {
+	r.exitMu.Lock()
+	defer r.exitMu.Unlock()
+	if !r.exitRequested {
+		return 0, false
+	}
+	code := r.exitCode
+	r.exitRequested = false
+	return code, true
 }
 
 func (r *Runtime) addCleanup(fn func()) {

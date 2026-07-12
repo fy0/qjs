@@ -25,7 +25,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
+func TestInstallHostRuntimeCoreAPIs(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	rt := must(qjs.New(qjs.Option{
@@ -35,9 +35,9 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 	}))
 	defer rt.Close()
 
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime())
 
-	result, err := rt.Eval("txiki-core.js", qjs.Code(`
+	result, err := rt.Eval("host-core.js", qjs.Code(`
 		export default await (async () => {
 			console.log("hello", { api: "console" });
 			await qjs.fs.mkdir("nested", { recursive: true });
@@ -105,7 +105,7 @@ func TestInstallTxikiRuntimeCoreAPIs(t *testing.T) {
 	require.Empty(t, stderr.String())
 }
 
-func TestInstallTxikiRuntimeFetch(t *testing.T) {
+func TestInstallHostRuntimeFetch(t *testing.T) {
 	serverURL := startFastHTTPServer(t, func(ctx *fasthttp.RequestCtx) {
 		switch string(ctx.Path()) {
 		case "/echo":
@@ -144,10 +144,10 @@ func TestInstallTxikiRuntimeFetch(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime())
 
 	serverURLJSON := must(json.Marshal(serverURL))
-	result, err := rt.Eval("txiki-fetch.js", qjs.Code(`
+	result, err := rt.Eval("host-fetch.js", qjs.Code(`
 		export default await (async () => {
 			const headers = new Headers([["X-Test", "yes"]]);
 			headers.append("X-Unused", "drop");
@@ -218,12 +218,12 @@ func TestInstallTxikiRuntimeFetch(t *testing.T) {
 	require.Contains(t, jsonResult, `"constructedText":"created"`)
 }
 
-func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
+func TestInstallHostRuntimeFileSystemAPIs(t *testing.T) {
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime())
 
-	result, err := rt.Eval("txiki-fs.js", qjs.Code(`
+	result, err := rt.Eval("host-fs.js", qjs.Code(`
 		import fsDefault, { promises as fsPromises, readFileSync as importedReadFileSync } from "fs";
 		import { readFile as importedReadFile, writeFile as importedWriteFile, rm as importedRm } from "fs/promises";
 		import nodeFSDefault, { promises as nodeFSPromises } from "node:fs";
@@ -282,18 +282,18 @@ func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
 				names,
 				fileName: fileStat.name,
 				fileSize: fileStat.size,
-				isFile: fileStat.isFile,
-				isDir: dirStat.isDir,
+				isFile: fileStat.isFile(),
+				isDir: dirStat.isDirectory(),
 				existsBefore,
 				existsAfterFileRemove,
 				rootExistsAfterRemove: await qjs.fs.exists("dir"),
-				escapeBlocked: escapeError.includes("escapes runtime CWD"),
+				escapeBlocked: escapeError.includes("escapes filesystem root"),
 				mkdirIsPromise,
 				writeIsPromise,
 				readInitiallyPending,
 				syncReadIsPromise: typeof syncText?.then === "function",
-				importedPromiseAPI: fsPromises.readFile === qjs.fs.readFile,
-				nodePromiseAPI: nodeFSPromises.readFile === qjs.fs.readFile,
+				importedPromiseAPI: fsPromises.readFile === qjs.fs.promises.readFile,
+				nodePromiseAPI: nodeFSPromises.readFile === qjs.fs.promises.readFile,
 				nodeDefaultAPI: nodeFSDefault.promises === qjs.fs.promises
 			});
 		})();
@@ -328,12 +328,12 @@ func TestInstallTxikiRuntimeFileSystemAPIs(t *testing.T) {
 	require.Contains(t, jsonResult, `"nodeDefaultAPI":true`)
 }
 
-func TestInstallTxikiRuntimeWebPlatformEvents(t *testing.T) {
+func TestInstallHostRuntimeWebPlatformEvents(t *testing.T) {
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime())
 
-	result, err := rt.Eval("txiki-events.js", qjs.Code(`
+	result, err := rt.Eval("host-events.js", qjs.Code(`
 		export default await (async () => {
 			const target = new EventTarget();
 			let eventSeen = "";
@@ -374,12 +374,12 @@ func TestInstallTxikiRuntimeWebPlatformEvents(t *testing.T) {
 	require.Contains(t, jsonResult, `"fetchAbort":"stop"`)
 }
 
-func TestInstallTxikiRuntimeWebPlatformUtilities(t *testing.T) {
+func TestInstallHostRuntimeWebPlatformUtilities(t *testing.T) {
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime())
 
-	result, err := rt.Eval("txiki-web-utils.js", qjs.Code(`
+	result, err := rt.Eval("host-web-utils.js", qjs.Code(`
 		export default await (async () => {
 			const encoded = new TextEncoder().encode("hello 世界");
 			const decoded = new TextDecoder().decode(encoded);
@@ -461,7 +461,7 @@ func TestInstallTxikiRuntimeWebPlatformUtilities(t *testing.T) {
 	assertPropBool("selfIsGlobal", true)
 }
 
-func TestInstallTxikiRuntimeExecFile(t *testing.T) {
+func TestInstallHostRuntimeExecFile(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		t.Skip("go binary is not on PATH")
@@ -470,12 +470,14 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+		EnableFeatures: qjs.HostRuntimeFeatureChildProcess,
+	}))
 
 	goBinJSON := must(json.Marshal(goBin))
 	shellJSON := must(json.Marshal(shell))
 	shellArgsJSON := must(json.Marshal(shellArgs))
-	result, err := rt.Eval("txiki-process.js", qjs.Code(`
+	result, err := rt.Eval("host-process.js", qjs.Code(`
 		import processDefault, { cwd as importedCwd, env as importedEnv } from "node:process";
 		import bareProcess from "process";
 
@@ -529,8 +531,18 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 	defer result.Free()
 
 	jsonResult := result.String()
-	require.Contains(t, jsonResult, `"platform":"`+goruntime.GOOS+`"`)
-	require.Contains(t, jsonResult, `"arch":"`+goruntime.GOARCH+`"`)
+	expectedPlatform := goruntime.GOOS
+	if expectedPlatform == "windows" {
+		expectedPlatform = "win32"
+	}
+	expectedArch := goruntime.GOARCH
+	if expectedArch == "amd64" {
+		expectedArch = "x64"
+	} else if expectedArch == "386" {
+		expectedArch = "ia32"
+	}
+	require.Contains(t, jsonResult, `"platform":"`+expectedPlatform+`"`)
+	require.Contains(t, jsonResult, `"arch":"`+expectedArch+`"`)
 	require.Contains(t, jsonResult, `"argvIsFrozen":true`)
 	require.Contains(t, jsonResult, `"argsIsFrozen":true`)
 	require.Contains(t, jsonResult, `"moduleDefaultSame":true`)
@@ -553,20 +565,20 @@ func TestInstallTxikiRuntimeExecFile(t *testing.T) {
 	require.True(t, strings.Contains(jsonResult, `"syncStdout":"go`), jsonResult)
 }
 
-func TestInstallTxikiRuntimeFeatureOptions(t *testing.T) {
+func TestInstallHostRuntimeFeatureOptions(t *testing.T) {
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime(qjs.TxikiRuntimeOptions{
-		DisableFeatures: qjs.TxikiRuntimeFeatureProcess | qjs.TxikiRuntimeFeatureFS,
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+		DisableFeatures: qjs.HostRuntimeFeatureProcess | qjs.HostRuntimeFeatureFS,
 	}))
 
-	result, err := rt.Eval("txiki-disabled-features.js", qjs.Code(`
+	result, err := rt.Eval("host-disabled-features.js", qjs.Code(`
 		export default JSON.stringify({
 			processGlobal: typeof globalThis.process,
 			qjsProcess: typeof qjs.process,
 			fs: typeof qjs.fs,
 			execHost: typeof globalThis.__qjs_exec_file,
-			fsHost: typeof globalThis.__qjs_fs_read_file,
+			fsHost: typeof globalThis.__qjs_fs_sync,
 			fetch: typeof globalThis.fetch
 		});
 	`), qjs.TypeModule())
@@ -582,7 +594,7 @@ func TestInstallTxikiRuntimeFeatureOptions(t *testing.T) {
 	require.Contains(t, jsonResult, `"fetch":"function"`)
 }
 
-func TestInstallTxikiRuntimeTCPClient(t *testing.T) {
+func TestInstallHostRuntimeTCPClient(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer listener.Close()
@@ -607,9 +619,9 @@ func TestInstallTxikiRuntimeTCPClient(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-tcp-client.js", qjs.Code(`
+	result, err := rt.Eval("host-tcp-client.js", qjs.Code(`
 		export default await (async () => {
 			const socket = new TCPSocket("127.0.0.1", `+portText+`);
 			await socket.write("ping");
@@ -624,7 +636,7 @@ func TestInstallTxikiRuntimeTCPClient(t *testing.T) {
 	<-done
 }
 
-func TestInstallTxikiRuntimeTCPServer(t *testing.T) {
+func TestInstallHostRuntimeTCPServer(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan string, 1)
 	go func() {
@@ -660,9 +672,9 @@ func TestInstallTxikiRuntimeTCPServer(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-tcp-server.js", qjs.Code(`
+	result, err := rt.Eval("host-tcp-server.js", qjs.Code(`
 		export default await (async () => {
 			const server = new TCPServerSocket("127.0.0.1", { localPort: `+port+` });
 			const socket = await server.accept();
@@ -679,7 +691,7 @@ func TestInstallTxikiRuntimeTCPServer(t *testing.T) {
 	require.Equal(t, "world", <-done)
 }
 
-func TestInstallTxikiRuntimeUDP(t *testing.T) {
+func TestInstallHostRuntimeUDP(t *testing.T) {
 	port := freeUDPPort(t)
 	goAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -710,9 +722,9 @@ func TestInstallTxikiRuntimeUDP(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-udp.js", qjs.Code(`
+	result, err := rt.Eval("host-udp.js", qjs.Code(`
 		export default await (async () => {
 			const socket = new UDPSocket({ localAddress: "127.0.0.1", localPort: `+port+` });
 			const message = await socket.receive(16);
@@ -728,7 +740,7 @@ func TestInstallTxikiRuntimeUDP(t *testing.T) {
 	require.Equal(t, "pong", <-done)
 }
 
-func TestInstallTxikiRuntimeHTTPServer(t *testing.T) {
+func TestInstallHostRuntimeHTTPServer(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan string, 1)
 	go func() {
@@ -759,9 +771,9 @@ func TestInstallTxikiRuntimeHTTPServer(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-http-server.js", qjs.Code(`
+	result, err := rt.Eval("host-http-server.js", qjs.Code(`
 		export default await (async () => {
 			const server = qjs.http.serve({ hostname: "127.0.0.1", port: `+port+` });
 			const request = await server.accept();
@@ -779,7 +791,7 @@ func TestInstallTxikiRuntimeHTTPServer(t *testing.T) {
 	require.Equal(t, "201 Created|yes|ok:/hello", <-done)
 }
 
-func TestInstallTxikiRuntimeWebSocketServer(t *testing.T) {
+func TestInstallHostRuntimeWebSocketServer(t *testing.T) {
 	port := freeTCPPort(t)
 	done := make(chan string, 1)
 	go func() {
@@ -803,9 +815,9 @@ func TestInstallTxikiRuntimeWebSocketServer(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-ws-server.js", qjs.Code(`
+	result, err := rt.Eval("host-ws-server.js", qjs.Code(`
 		export default await (async () => {
 			const server = qjs.http.serve({ hostname: "127.0.0.1", port: `+port+` });
 			const request = await server.accept();
@@ -824,7 +836,7 @@ func TestInstallTxikiRuntimeWebSocketServer(t *testing.T) {
 	require.Equal(t, "pong", <-done)
 }
 
-func TestInstallTxikiRuntimeWebSocketClient(t *testing.T) {
+func TestInstallHostRuntimeWebSocketClient(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer listener.Close()
@@ -871,9 +883,9 @@ func TestInstallTxikiRuntimeWebSocketClient(t *testing.T) {
 
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
-	result, err := rt.Eval("txiki-ws-client.js", qjs.Code(`
+	result, err := rt.Eval("host-ws-client.js", qjs.Code(`
 		export default await (async () => {
 			const ws = new WebSocket("ws://127.0.0.1:`+port+`/echo");
 			await ws.opened;
@@ -891,10 +903,10 @@ func TestInstallTxikiRuntimeWebSocketClient(t *testing.T) {
 	require.Equal(t, "ping", <-done)
 }
 
-func TestInstallTxikiRuntimeWorker(t *testing.T) {
+func TestInstallHostRuntimeWorker(t *testing.T) {
 	rt := must(qjs.New(qjs.Option{CWD: t.TempDir()}))
 	defer rt.Close()
-	require.NoError(t, rt.InstallTxikiRuntime())
+	require.NoError(t, rt.InstallHostRuntime(qjs.HostRuntimeOptions{Profile: qjs.HostRuntimeProfileAll}))
 
 	source := `
 		self.postMessage({ type: "ready" });
@@ -904,7 +916,7 @@ func TestInstallTxikiRuntimeWorker(t *testing.T) {
 	`
 	sourceJSON := must(json.Marshal(source))
 
-	result, err := rt.Eval("txiki-worker.js", qjs.Code(`
+	result, err := rt.Eval("host-worker.js", qjs.Code(`
 		export default await (async () => {
 			const worker = new Worker(`+string(sourceJSON)+`, { eval: true });
 			const seen = [];

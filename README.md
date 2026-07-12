@@ -269,9 +269,9 @@ defer result.Free()
 log.Println(result.String())
 ```
 
-### Optional txiki.js-inspired runtime APIs
+### Optional host runtime
 
-QJS keeps the default runtime minimal. Install the optional host-backed APIs when a runtime should expose Web-like and system features:
+QJS keeps a new runtime minimal. Call `InstallHostRuntime` once to add QJS-owned Web and Node-style APIs. The default `NodeTool` profile is intended for trusted, pre-bundled ESM tools:
 
 ```go
 rt, err := qjs.New(qjs.Option{CWD: "/app/sandbox"})
@@ -280,7 +280,7 @@ if err != nil {
 }
 defer rt.Close()
 
-if err := rt.InstallTxikiRuntime(); err != nil {
+if err := rt.InstallHostRuntime(); err != nil {
 	log.Fatal(err)
 }
 
@@ -303,9 +303,34 @@ if err != nil {
 defer result.Free()
 ```
 
-The installer currently provides `DOMException`, `Event`, `EventTarget`, `MessageEvent`, `ErrorEvent`, `AbortController`, `TextEncoder`, `TextDecoder`, `Blob`, `File`, `FormData`, `URLSearchParams`, `structuredClone`, `atob`, `btoa`, `queueMicrotask`, `performance.now`, `self`, `console`, `setTimeout`/`setInterval` when QuickJS does not already provide them, `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`, `fetch`, `qjs.fs`, importable `fs`, `node:fs`, `fs/promises`, and `node:fs/promises` modules, `process`, importable `process` and `node:process` modules, portable signal listeners via `process.onSignal("SIGINT", fn)` plus `process.pollSignals()`, direct socket classes (`TCPSocket`, `TCPServerSocket`, `UDPSocket`, `PipeSocket`, `PipeServerSocket`), `qjs.net.connect/listen`, `qjs.http.serve()`, a blocking-read/write `WebSocket` host bridge for `ws://` endpoints and server upgrades, and host-backed `Worker`. The `fetch` client and `qjs.http.serve()` server are backed by `github.com/valyala/fasthttp`; pass `TxikiRuntimeOptions.FetchClient` to customize the `*fasthttp.Client`.
+Profiles are conservative presets; `EnableFeatures` and `DisableFeatures` are applied after the preset:
 
-Filesystem APIs follow the txiki.js-style Promise shape through `qjs.fs` methods. The same API is importable from `fs/promises` and `node:fs/promises`, and is also exposed as `fs.promises` from `fs` / `node:fs`. Explicit synchronous variants are available as `qjs.fs.readFileSync`, `qjs.fs.writeFileSync`, `qjs.fs.mkdirSync`, `qjs.fs.readdirSync`, `qjs.fs.statSync`, `qjs.fs.existsSync`, `qjs.fs.removeSync`, and matching named exports from `fs`.
+| Profile | Enabled capabilities |
+| --- | --- |
+| `HostRuntimeProfileNodeTool` | Default. Crypto, streaming fetch, filesystem, process metadata/stdio, and Node compatibility modules. |
+| `HostRuntimeProfileBare` | No optional capability unless explicitly enabled. |
+| `HostRuntimeProfileAll` | Every capability, including experimental child process, sockets, HTTP/WebSocket server, and Worker APIs. |
+
+The default profile includes common Web primitives such as `AbortController`, `ReadableStream`, `TextEncoder`, `Blob`, `FormData`, `URLSearchParams`, `performance`, timers, `console`, and Web Crypto helpers. Its Node compatibility surface includes `Buffer`, `process`, and the built-in modules `fs`, `fs/promises`, `path`, `os`, `crypto`, `buffer`, and `perf_hooks`, with both bare and `node:` specifiers.
+
+This is a focused Node 24-style compatibility layer, not a Node.js installation. It is designed for single-file ESM bundles. It does not resolve `node_modules`, load arbitrary CommonJS packages, or implement every edge case of the Node standard library. The global `require` accepts supported built-ins only. A bundled TypeScript 5.9.3 non-watch compiler is executed by the test suite as the compatibility canary.
+
+#### Filesystem security
+
+Filesystem access is sandboxed by default. Relative and absolute JavaScript paths are resolved beneath `FileSystem.Root` (the runtime CWD by default), and Go's `os.Root` prevents `..` and symlink escapes. Use `FileSystemHost` only for trusted code that is explicitly allowed to access host paths:
+
+```go
+err := rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+	CWD: "/app",
+	FileSystem: qjs.FileSystemOptions{
+		Mode: qjs.FileSystemHost,
+	},
+})
+```
+
+In host mode, relative paths use `CWD` and absolute paths are unrestricted; `FileSystem.Root` is not a host-mode boundary.
+
+Both promise, callback, and common synchronous filesystem forms are available. Errors expose Node-style fields such as `code`, `errno`, `syscall`, and `path`.
 
 ```js
 import fs, { promises as fsp, readFileSync } from "node:fs";
@@ -318,21 +343,32 @@ console.log(await fsp.stat("hello.txt"));
 await rm("hello.txt");
 ```
 
-`process` provides a small txiki.js-inspired host process surface: `pid`, `ppid`, `platform`, `arch`, `argv`, `args`, `execPath`, `cwd()`, `chdir(path)`, mutable runtime-local `env`, `kill(pid, signal)`, `execFile()`, `execFileSync()`, and portable signal polling. `process.env` changes affect child process calls from this runtime but do not mutate the embedding Go process. `process.execFile()` runs asynchronously and resolves with `{ exitCode, success, stdout, stderr }`; use `process.execFileSync()` when a blocking child-process call is intended.
+#### Fetch and process behavior
 
-Runtime features can be restricted at install time. A zero `Features` value keeps the default set enabled; use `DisableFeatures` to remove capabilities for sandboxed contexts.
+`fetch` uses `net/http` and returns response headers before the body is complete. `Response.body` is streamed, `AbortSignal` cancels both requests and in-progress body reads, common compression encodings are decoded, and cross-origin redirects strip authorization and cookie headers. `MaxBufferedBodyBytes` defaults to 64 MiB and limits convenience methods such as `response.text()`; direct stream consumers are not buffered by that limit. Pass `HostRuntimeOptions.FetchClient` to customize the `*http.Client` transport and policy.
+
+`process.env` is runtime-local and never mutates the embedding Go process. `process.exit(code)` stops the current evaluation by returning a `*qjs.ProcessExitError`; it never terminates the Go host. Child-process and signal APIs are separate capabilities and are disabled by the default profile.
+
+Use `HostRuntimeProfileBare` to grant a small explicit capability set:
 
 ```go
-err := rt.InstallTxikiRuntime(qjs.TxikiRuntimeOptions{
-	DisableFeatures: qjs.TxikiRuntimeFeatureProcess |
-		qjs.TxikiRuntimeFeatureFS |
-		qjs.TxikiRuntimeFeatureNet |
-		qjs.TxikiRuntimeFeatureHTTP |
-		qjs.TxikiRuntimeFeatureWorker,
+err := rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+	Profile: qjs.HostRuntimeProfileBare,
+	EnableFeatures: qjs.HostRuntimeFeatureFetch |
+		qjs.HostRuntimeFeatureCrypto,
 })
 ```
 
+Networking servers, WebSocket, Worker, and child-process bridges remain experimental. They require explicit features or `HostRuntimeProfileAll`:
+
 ```go
+err := rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+	Profile: qjs.HostRuntimeProfileAll,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
 result, err := rt.Eval("net.js", qjs.Code(`
 	export default await (async () => {
 		const server = qjs.http.serve({ hostname: "127.0.0.1", port: 8080 });
@@ -347,28 +383,6 @@ result, err := rt.Eval("net.js", qjs.Code(`
 		}
 		server.close();
 		return true;
-	})();
-`), qjs.TypeModule())
-```
-
-Worker messages use JSON serialization and explicit polling on the parent runtime:
-
-```go
-result, err := rt.Eval("worker.js", qjs.Code(`
-	export default await (async () => {
-		const worker = new Worker(
-			"self.onmessage = e => self.postMessage(e.data + 1)",
-			{ eval: true },
-		);
-		const messages = [];
-		worker.onmessage = event => messages.push(event.data);
-		worker.postMessage(41);
-		while (messages.length === 0) {
-			worker.pollMessages();
-			await new Promise(resolve => setTimeout(resolve, 1));
-		}
-		worker.terminate();
-		return messages[0];
 	})();
 `), qjs.TypeModule())
 ```
@@ -746,7 +760,7 @@ go get github.com/fastschema/qjs
 import "github.com/fastschema/qjs"
 ```
 
-**Compatible with Go 1.22.0+**
+**Compatible with Go 1.24.0+**
 
 ## Architecture
 
@@ -874,7 +888,7 @@ defer result.Free()
 
 ### Prerequisites
 
-- Go 1.23.0+
+- Go 1.24.0+
 - WASI SDK (for WebAssembly compilation)
 - CMake 3.16+
 - Make

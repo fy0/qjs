@@ -10,18 +10,18 @@ import (
 	"sync/atomic"
 )
 
-type txikiWorkerManager struct {
+type hostWorkerManager struct {
 	mu      sync.Mutex
 	nextID  int64
-	workers map[int64]*txikiWorker
+	workers map[int64]*hostWorker
 }
 
-type txikiWorker struct {
+type hostWorker struct {
 	id             int64
 	source         string
 	filename       string
 	module         bool
-	config         txikiRuntimeConfig
+	config         hostRuntimeConfig
 	cancel         context.CancelFunc
 	parentToWorker chan string
 	workerToParent chan string
@@ -31,19 +31,19 @@ type txikiWorker struct {
 	err            error
 }
 
-type txikiWorkerCreateOptions struct {
+type hostWorkerCreateOptions struct {
 	Eval bool   `json:"eval"`
 	Type string `json:"type"`
 	Name string `json:"name"`
 }
 
-func newTxikiWorkerManager() *txikiWorkerManager {
-	return &txikiWorkerManager{
-		workers: map[int64]*txikiWorker{},
+func newHostWorkerManager() *hostWorkerManager {
+	return &hostWorkerManager{
+		workers: map[int64]*hostWorker{},
 	}
 }
 
-func (s *txikiRuntimeState) installWorkerHostFunctions(c *Context) {
+func (s *hostRuntimeState) installWorkerHostFunctions(c *Context) {
 	c.SetFunc("__qjs_worker_create", s.workerCreate)
 	c.SetFunc("__qjs_worker_post", s.workerPost)
 	c.SetFunc("__qjs_worker_poll", s.workerPoll)
@@ -51,7 +51,7 @@ func (s *txikiRuntimeState) installWorkerHostFunctions(c *Context) {
 	c.SetFunc("__qjs_worker_terminate", s.workerTerminate)
 }
 
-func (m *txikiWorkerManager) add(worker *txikiWorker) int64 {
+func (m *hostWorkerManager) add(worker *hostWorker) int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -62,7 +62,7 @@ func (m *txikiWorkerManager) add(worker *txikiWorker) int64 {
 	return worker.id
 }
 
-func (m *txikiWorkerManager) get(id int64) (*txikiWorker, error) {
+func (m *hostWorkerManager) get(id int64) (*hostWorker, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -74,7 +74,7 @@ func (m *txikiWorkerManager) get(id int64) (*txikiWorker, error) {
 	return worker, nil
 }
 
-func (m *txikiWorkerManager) delete(id int64) *txikiWorker {
+func (m *hostWorkerManager) delete(id int64) *hostWorker {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -84,10 +84,10 @@ func (m *txikiWorkerManager) delete(id int64) *txikiWorker {
 	return worker
 }
 
-func (m *txikiWorkerManager) close() {
+func (m *hostWorkerManager) close() {
 	m.mu.Lock()
 	workers := m.workers
-	m.workers = map[int64]*txikiWorker{}
+	m.workers = map[int64]*hostWorker{}
 	m.mu.Unlock()
 
 	for _, worker := range workers {
@@ -95,14 +95,14 @@ func (m *txikiWorkerManager) close() {
 	}
 }
 
-func (s *txikiRuntimeState) workerCreate(this *This) (*Value, error) {
+func (s *hostRuntimeState) workerCreate(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("Worker requires a script source or path")
 	}
 
 	sourceOrPath := args[0].String()
-	var options txikiWorkerCreateOptions
+	var options hostWorkerCreateOptions
 	if len(args) > 1 {
 		if raw := args[1].String(); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &options); err != nil {
@@ -133,7 +133,7 @@ func (s *txikiRuntimeState) workerCreate(this *This) (*Value, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	worker := &txikiWorker{
+	worker := &hostWorker{
 		source:         source,
 		filename:       filename,
 		module:         options.Type == "module",
@@ -150,7 +150,7 @@ func (s *txikiRuntimeState) workerCreate(this *This) (*Value, error) {
 	return this.Context().NewInt64(id), nil
 }
 
-func (s *txikiRuntimeState) workerPost(this *This) (*Value, error) {
+func (s *hostRuntimeState) workerPost(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 2 {
 		return nil, errors.New("Worker.postMessage requires worker id and message")
@@ -173,7 +173,7 @@ func (s *txikiRuntimeState) workerPost(this *This) (*Value, error) {
 	}
 }
 
-func (s *txikiRuntimeState) workerPoll(this *This) (*Value, error) {
+func (s *hostRuntimeState) workerPoll(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("Worker.pollMessages requires worker id")
@@ -198,7 +198,7 @@ func (s *txikiRuntimeState) workerPoll(this *This) (*Value, error) {
 	}
 }
 
-func (s *txikiRuntimeState) workerError(this *This) (*Value, error) {
+func (s *hostRuntimeState) workerError(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("Worker.error requires worker id")
@@ -216,7 +216,7 @@ func (s *txikiRuntimeState) workerError(this *This) (*Value, error) {
 	return this.Context().NewString(""), nil
 }
 
-func (s *txikiRuntimeState) workerTerminate(this *This) (*Value, error) {
+func (s *hostRuntimeState) workerTerminate(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -230,7 +230,8 @@ func (s *txikiRuntimeState) workerTerminate(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (w *txikiWorker) run(ctx context.Context) {
+func (w *hostWorker) run(ctx context.Context) {
+	defer w.stopped.Store(true)
 	defer close(w.done)
 	defer close(w.workerToParent)
 
@@ -246,26 +247,30 @@ func (w *txikiWorker) run(ctx context.Context) {
 	}
 	defer rt.Close()
 
-	if err := rt.InstallTxikiRuntime(TxikiRuntimeOptions{
-		CWD:         w.config.cwd,
-		Args:        w.config.args,
-		Env:         w.config.env,
-		ExecPath:    w.config.execPath,
-		Features:    w.config.features,
-		Stdout:      w.config.stdout,
-		Stderr:      w.config.stderr,
-		FetchClient: w.config.fetchClient,
+	if err := rt.InstallHostRuntime(HostRuntimeOptions{
+		CWD:                  w.config.cwd,
+		Args:                 w.config.args,
+		Env:                  w.config.env,
+		ExecPath:             w.config.execPath,
+		Profile:              HostRuntimeProfileBare,
+		EnableFeatures:       w.config.features,
+		FileSystem:           w.config.fs,
+		Stdin:                w.config.stdin,
+		Stdout:               w.config.stdout,
+		Stderr:               w.config.stderr,
+		FetchClient:          w.config.fetchClient,
+		MaxBufferedBodyBytes: w.config.maxBodySize,
 	}); err != nil {
 		w.setError(err)
 		return
 	}
 
 	ctxJS := rt.Context()
-	workerBridge := &txikiWorkerBridge{worker: w}
+	workerBridge := &hostWorkerBridge{worker: w}
 	ctxJS.SetFunc("__qjs_worker_post_parent", workerBridge.postParent)
 	ctxJS.SetFunc("__qjs_worker_close_self", workerBridge.closeSelf)
 
-	if result, err := ctxJS.Eval("worker-bootstrap.js", Code(txikiWorkerBootstrapScript)); err != nil {
+	if result, err := ctxJS.Eval("worker-bootstrap.js", Code(hostWorkerBootstrapScript)); err != nil {
 		w.setError(err)
 		return
 	} else if result != nil {
@@ -315,7 +320,7 @@ func (w *txikiWorker) run(ctx context.Context) {
 	}
 }
 
-func (w *txikiWorker) stop() {
+func (w *hostWorker) stop() {
 	if w.stopped.Swap(true) {
 		return
 	}
@@ -323,11 +328,10 @@ func (w *txikiWorker) stop() {
 	if w.cancel != nil {
 		w.cancel()
 	}
-	close(w.parentToWorker)
 	<-w.done
 }
 
-func (w *txikiWorker) setError(err error) {
+func (w *hostWorker) setError(err error) {
 	if err == nil {
 		return
 	}
@@ -337,18 +341,18 @@ func (w *txikiWorker) setError(err error) {
 	w.errMu.Unlock()
 }
 
-func (w *txikiWorker) error() error {
+func (w *hostWorker) error() error {
 	w.errMu.Lock()
 	defer w.errMu.Unlock()
 
 	return w.err
 }
 
-type txikiWorkerBridge struct {
-	worker *txikiWorker
+type hostWorkerBridge struct {
+	worker *hostWorker
 }
 
-func (b *txikiWorkerBridge) postParent(this *This) (*Value, error) {
+func (b *hostWorkerBridge) postParent(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -362,7 +366,7 @@ func (b *txikiWorkerBridge) postParent(this *This) (*Value, error) {
 	}
 }
 
-func (b *txikiWorkerBridge) closeSelf(this *This) (*Value, error) {
+func (b *hostWorkerBridge) closeSelf(this *This) (*Value, error) {
 	if b.worker.cancel != nil {
 		b.worker.cancel()
 	}
@@ -370,7 +374,7 @@ func (b *txikiWorkerBridge) closeSelf(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-const txikiWorkerBootstrapScript = `
+const hostWorkerBootstrapScript = `
 (function () {
   function parseMessage(raw) {
     try {

@@ -25,14 +25,17 @@ import (
 
 const webSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-type txikiHTTPServer struct {
-	id       int64
-	server   *fasthttp.Server
-	listener net.Listener
-	requests chan *txikiHTTPRequest
+type hostHTTPServer struct {
+	id        int64
+	server    *fasthttp.Server
+	listener  net.Listener
+	requests  chan *hostHTTPRequest
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
-type txikiHTTPRequest struct {
+type hostHTTPRequest struct {
 	id       int64
 	serverID int64
 	method   string
@@ -42,23 +45,23 @@ type txikiHTTPRequest struct {
 	body     []byte
 	ws       bool
 	ctx      *fasthttp.RequestCtx
-	response chan txikiHTTPResponse
+	response chan hostHTTPResponse
 }
 
-type txikiHTTPResponse struct {
+type hostHTTPResponse struct {
 	status        int
 	headers       map[string][]string
 	body          []byte
 	upgrade       bool
-	upgradeResult chan txikiHTTPUpgradeResult
+	upgradeResult chan hostHTTPUpgradeResult
 }
 
-type txikiHTTPUpgradeResult struct {
+type hostHTTPUpgradeResult struct {
 	info map[string]any
 	err  error
 }
 
-type txikiWebSocketConn struct {
+type hostWebSocketConn struct {
 	id       int64
 	conn     net.Conn
 	isClient bool
@@ -77,8 +80,8 @@ func newSyncMutex() syncMutex {
 	return syncMutex{ch: make(chan struct{}, 1)}
 }
 
-func newTxikiWebSocketConn(conn net.Conn, isClient bool) *txikiWebSocketConn {
-	ws := &txikiWebSocketConn{
+func newHostWebSocketConn(conn net.Conn, isClient bool) *hostWebSocketConn {
+	ws := &hostWebSocketConn{
 		conn:     conn,
 		isClient: isClient,
 		mu:       newSyncMutex(),
@@ -92,18 +95,18 @@ func newTxikiWebSocketConn(conn net.Conn, isClient bool) *txikiWebSocketConn {
 	return ws
 }
 
-func (ws *txikiWebSocketConn) setConn(conn net.Conn) {
+func (ws *hostWebSocketConn) setConn(conn net.Conn) {
 	ws.conn = conn
 	close(ws.ready)
 }
 
-func (ws *txikiWebSocketConn) fail(err error) {
+func (ws *hostWebSocketConn) fail(err error) {
 	ws.err = err
 	close(ws.ready)
 	ws.closeDone()
 }
 
-func (ws *txikiWebSocketConn) waitConn() (net.Conn, error) {
+func (ws *hostWebSocketConn) waitConn() (net.Conn, error) {
 	<-ws.ready
 	if ws.err != nil {
 		return nil, ws.err
@@ -115,7 +118,7 @@ func (ws *txikiWebSocketConn) waitConn() (net.Conn, error) {
 	return ws.conn, nil
 }
 
-func (ws *txikiWebSocketConn) closeDone() {
+func (ws *hostWebSocketConn) closeDone() {
 	ws.once.Do(func() {
 		close(ws.done)
 	})
@@ -129,7 +132,7 @@ func (m syncMutex) unlock() {
 	<-m.ch
 }
 
-func (s *txikiRuntimeState) installHTTPHostFunctions(c *Context) {
+func (s *hostRuntimeState) installHTTPHostFunctions(c *Context) {
 	c.SetFunc("__qjs_http_listen", s.httpListen)
 	c.SetFunc("__qjs_http_accept", s.httpAccept)
 	c.SetFunc("__qjs_http_respond", s.httpRespond)
@@ -141,7 +144,7 @@ func (s *txikiRuntimeState) installHTTPHostFunctions(c *Context) {
 	c.SetFunc("__qjs_ws_close", s.wsClose)
 }
 
-func (n *txikiNetState) addHTTPServer(server *txikiHTTPServer) int64 {
+func (n *hostNetState) addHTTPServer(server *hostHTTPServer) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -152,7 +155,7 @@ func (n *txikiNetState) addHTTPServer(server *txikiHTTPServer) int64 {
 	return id
 }
 
-func (n *txikiNetState) httpServer(id int64) (*txikiHTTPServer, error) {
+func (n *hostNetState) httpServer(id int64) (*hostHTTPServer, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -164,7 +167,7 @@ func (n *txikiNetState) httpServer(id int64) (*txikiHTTPServer, error) {
 	return server, nil
 }
 
-func (n *txikiNetState) addHTTPRequest(request *txikiHTTPRequest) int64 {
+func (n *hostNetState) addHTTPRequest(request *hostHTTPRequest) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -175,7 +178,7 @@ func (n *txikiNetState) addHTTPRequest(request *txikiHTTPRequest) int64 {
 	return id
 }
 
-func (n *txikiNetState) takeHTTPRequest(id int64) (*txikiHTTPRequest, error) {
+func (n *hostNetState) takeHTTPRequest(id int64) (*hostHTTPRequest, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -188,7 +191,7 @@ func (n *txikiNetState) takeHTTPRequest(id int64) (*txikiHTTPRequest, error) {
 	return request, nil
 }
 
-func (n *txikiNetState) addWebSocket(ws *txikiWebSocketConn) int64 {
+func (n *hostNetState) addWebSocket(ws *hostWebSocketConn) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -199,7 +202,7 @@ func (n *txikiNetState) addWebSocket(ws *txikiWebSocketConn) int64 {
 	return id
 }
 
-func (n *txikiNetState) webSocket(id int64) (*txikiWebSocketConn, error) {
+func (n *hostNetState) webSocket(id int64) (*hostWebSocketConn, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -211,7 +214,7 @@ func (n *txikiNetState) webSocket(id int64) (*txikiWebSocketConn, error) {
 	return ws, nil
 }
 
-func (n *txikiNetState) closeWebSocket(id int64) error {
+func (n *hostNetState) closeWebSocket(id int64) error {
 	n.mu.Lock()
 	ws := n.webSockets[id]
 	delete(n.webSockets, id)
@@ -224,7 +227,7 @@ func (n *txikiNetState) closeWebSocket(id int64) error {
 	return ws.close()
 }
 
-func (s *txikiRuntimeState) httpListen(this *This) (*Value, error) {
+func (s *hostRuntimeState) httpListen(this *This) (*Value, error) {
 	args := this.Args()
 	host := "127.0.0.1"
 	if len(args) > 0 && strings.TrimSpace(args[0].String()) != "" {
@@ -241,9 +244,12 @@ func (s *txikiRuntimeState) httpListen(this *This) (*Value, error) {
 		return nil, err
 	}
 
-	server := &txikiHTTPServer{
+	serverCtx, cancel := context.WithCancel(s.async.ctx)
+	server := &hostHTTPServer{
 		listener: listener,
-		requests: make(chan *txikiHTTPRequest),
+		requests: make(chan *hostHTTPRequest),
+		ctx:      serverCtx,
+		cancel:   cancel,
 	}
 	server.server = &fasthttp.Server{
 		Handler: func(ctx *fasthttp.RequestCtx) {
@@ -268,7 +274,7 @@ func (s *txikiRuntimeState) httpListen(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) httpAccept(this *This) (*Value, error) {
+func (s *hostRuntimeState) httpAccept(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("http accept requires a server id")
@@ -279,8 +285,13 @@ func (s *txikiRuntimeState) httpAccept(this *This) (*Value, error) {
 		return nil, err
 	}
 
-	request, ok := <-server.requests
-	if !ok {
+	var request *hostHTTPRequest
+	select {
+	case request = <-server.requests:
+	case <-server.ctx.Done():
+		return nil, errors.New("http server is closed")
+	}
+	if request == nil {
 		return nil, errors.New("http server is closed")
 	}
 
@@ -296,7 +307,7 @@ func (s *txikiRuntimeState) httpAccept(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) httpRespond(this *This) (*Value, error) {
+func (s *hostRuntimeState) httpRespond(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 4 {
 		return nil, errors.New("http respond requires request id, status, headers, and body")
@@ -317,7 +328,7 @@ func (s *txikiRuntimeState) httpRespond(this *This) (*Value, error) {
 		return nil, err
 	}
 
-	request.response <- txikiHTTPResponse{
+	request.response <- hostHTTPResponse{
 		status:  int(args[1].Int64()),
 		headers: headers,
 		body:    body,
@@ -326,7 +337,7 @@ func (s *txikiRuntimeState) httpRespond(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (s *txikiRuntimeState) httpUpgrade(this *This) (*Value, error) {
+func (s *hostRuntimeState) httpUpgrade(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("http upgrade requires request id")
@@ -337,8 +348,8 @@ func (s *txikiRuntimeState) httpUpgrade(this *This) (*Value, error) {
 		return nil, err
 	}
 
-	result := make(chan txikiHTTPUpgradeResult, 1)
-	request.response <- txikiHTTPResponse{
+	result := make(chan hostHTTPUpgradeResult, 1)
+	request.response <- hostHTTPResponse{
 		upgrade:       true,
 		upgradeResult: result,
 	}
@@ -351,7 +362,7 @@ func (s *txikiRuntimeState) httpUpgrade(this *This) (*Value, error) {
 	return ToJsValue(this.Context(), upgradeResult.info)
 }
 
-func (s *txikiRuntimeState) httpClose(this *This) (*Value, error) {
+func (s *hostRuntimeState) httpClose(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -369,14 +380,14 @@ func (s *txikiRuntimeState) httpClose(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (server *txikiHTTPServer) handle(state *txikiRuntimeState, ctx *fasthttp.RequestCtx) {
+func (server *hostHTTPServer) handle(state *hostRuntimeState, ctx *fasthttp.RequestCtx) {
 	body := append([]byte(nil), ctx.PostBody()...)
 	headers := map[string][]string{}
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
 		name := string(key)
 		headers[name] = append(headers[name], string(value))
 	})
-	request := &txikiHTTPRequest{
+	request := &hostHTTPRequest{
 		serverID: server.id,
 		method:   string(ctx.Method()),
 		url:      ctx.URI().String(),
@@ -385,21 +396,33 @@ func (server *txikiHTTPServer) handle(state *txikiRuntimeState, ctx *fasthttp.Re
 		body:     body,
 		ws:       isWebSocketRequest(ctx),
 		ctx:      ctx,
-		response: make(chan txikiHTTPResponse, 1),
+		response: make(chan hostHTTPResponse, 1),
 	}
 	state.net.addHTTPRequest(request)
 
 	select {
 	case server.requests <- request:
+	case <-server.ctx.Done():
+		state.net.takeHTTPRequestIgnore(request.id)
+		return
 	case <-ctx.Done():
 		state.net.takeHTTPRequestIgnore(request.id)
 		return
 	}
 
-	response := <-request.response
+	var response hostHTTPResponse
+	select {
+	case response = <-request.response:
+	case <-server.ctx.Done():
+		state.net.takeHTTPRequestIgnore(request.id)
+		return
+	case <-ctx.Done():
+		state.net.takeHTTPRequestIgnore(request.id)
+		return
+	}
 	if response.upgrade {
 		info, err := state.upgradeHTTPRequest(request)
-		response.upgradeResult <- txikiHTTPUpgradeResult{info: info, err: err}
+		response.upgradeResult <- hostHTTPUpgradeResult{info: info, err: err}
 		return
 	}
 
@@ -415,18 +438,20 @@ func (server *txikiHTTPServer) handle(state *txikiRuntimeState, ctx *fasthttp.Re
 	ctx.SetBody(response.body)
 }
 
-func (n *txikiNetState) takeHTTPRequestIgnore(id int64) {
+func (n *hostNetState) takeHTTPRequestIgnore(id int64) {
 	n.mu.Lock()
 	delete(n.httpRequests, id)
 	n.mu.Unlock()
 }
 
-func (server *txikiHTTPServer) close() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_ = server.server.ShutdownWithContext(ctx)
-	_ = server.listener.Close()
-	close(server.requests)
+func (server *hostHTTPServer) close() {
+	server.closeOnce.Do(func() {
+		server.cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.listener.Close()
+		_ = server.server.ShutdownWithContext(ctx)
+	})
 }
 
 func parseHTTPHeaders(raw string) (map[string][]string, error) {
@@ -455,13 +480,13 @@ func isWebSocketRequest(ctx *fasthttp.RequestCtx) bool {
 		len(ctx.Request.Header.Peek("Sec-WebSocket-Key")) > 0
 }
 
-func (s *txikiRuntimeState) upgradeHTTPRequest(request *txikiHTTPRequest) (map[string]any, error) {
+func (s *hostRuntimeState) upgradeHTTPRequest(request *hostHTTPRequest) (map[string]any, error) {
 	if !request.ws {
 		return nil, errors.New("request is not a websocket upgrade")
 	}
 
 	accept := computeWebSocketAccept(string(request.ctx.Request.Header.Peek("Sec-WebSocket-Key")))
-	ws := newTxikiWebSocketConn(nil, false)
+	ws := newHostWebSocketConn(nil, false)
 	id := s.net.addWebSocket(ws)
 	request.ctx.HijackSetNoResponse(true)
 	request.ctx.Hijack(func(conn net.Conn) {
@@ -485,7 +510,7 @@ func (s *txikiRuntimeState) upgradeHTTPRequest(request *txikiHTTPRequest) (map[s
 	}, nil
 }
 
-func (s *txikiRuntimeState) wsConnect(this *This) (*Value, error) {
+func (s *hostRuntimeState) wsConnect(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("websocket connect requires a url")
@@ -551,7 +576,7 @@ func (s *txikiRuntimeState) wsConnect(this *This) (*Value, error) {
 		return nil, errors.New("websocket upgrade returned invalid accept key")
 	}
 
-	ws := newTxikiWebSocketConn(conn, true)
+	ws := newHostWebSocketConn(conn, true)
 	id := s.net.addWebSocket(ws)
 
 	return ToJsValue(this.Context(), map[string]any{
@@ -560,7 +585,7 @@ func (s *txikiRuntimeState) wsConnect(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) wsRead(this *This) (*Value, error) {
+func (s *hostRuntimeState) wsRead(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return nil, errors.New("websocket read requires a socket id")
@@ -583,7 +608,7 @@ func (s *txikiRuntimeState) wsRead(this *This) (*Value, error) {
 	})
 }
 
-func (s *txikiRuntimeState) wsSend(this *This) (*Value, error) {
+func (s *hostRuntimeState) wsSend(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) < 2 {
 		return nil, errors.New("websocket send requires socket id and data")
@@ -611,7 +636,7 @@ func (s *txikiRuntimeState) wsSend(this *This) (*Value, error) {
 	return this.Context().NewUndefined(), nil
 }
 
-func (s *txikiRuntimeState) wsClose(this *This) (*Value, error) {
+func (s *hostRuntimeState) wsClose(this *This) (*Value, error) {
 	args := this.Args()
 	if len(args) == 0 {
 		return this.Context().NewUndefined(), nil
@@ -627,7 +652,7 @@ func computeWebSocketAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func (ws *txikiWebSocketConn) readMessage() (byte, []byte, error) {
+func (ws *hostWebSocketConn) readMessage() (byte, []byte, error) {
 	for {
 		opcode, payload, err := ws.readFrame()
 		if err != nil {
@@ -646,7 +671,7 @@ func (ws *txikiWebSocketConn) readMessage() (byte, []byte, error) {
 	}
 }
 
-func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
+func (ws *hostWebSocketConn) readFrame() (byte, []byte, error) {
 	conn, err := ws.waitConn()
 	if err != nil {
 		return 0, nil, err
@@ -701,7 +726,7 @@ func (ws *txikiWebSocketConn) readFrame() (byte, []byte, error) {
 	return opcode, payload, nil
 }
 
-func (ws *txikiWebSocketConn) writeFrame(opcode byte, payload []byte) error {
+func (ws *hostWebSocketConn) writeFrame(opcode byte, payload []byte) error {
 	conn, err := ws.waitConn()
 	if err != nil {
 		return err
@@ -753,7 +778,7 @@ func (ws *txikiWebSocketConn) writeFrame(opcode byte, payload []byte) error {
 	return err
 }
 
-func (ws *txikiWebSocketConn) close() error {
+func (ws *hostWebSocketConn) close() error {
 	if ws == nil {
 		return nil
 	}
