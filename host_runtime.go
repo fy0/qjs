@@ -84,6 +84,19 @@ type FileSystemOptions struct {
 	// Root is the sandbox boundary and defaults to the runtime CWD.
 	// FileSystemHost does not restrict access to Root.
 	Root string
+	// Mounts configures a static virtual filesystem namespace. When non-empty,
+	// each mount maps one top-level virtual path to an independent host root.
+	Mounts []FileSystemMount
+	// VirtualCWD is the initial virtual working directory in multi-mount mode.
+	// It defaults to "/".
+	VirtualCWD string
+}
+
+// FileSystemMount maps a top-level virtual path to a host directory.
+type FileSystemMount struct {
+	Path     string
+	Root     string
+	ReadOnly bool
 }
 
 // HostRuntimeOptions configures optional Web-like and Node-style host APIs.
@@ -307,12 +320,25 @@ func (c *Context) newHostRuntimeConfig(options ...HostRuntimeOptions) (hostRunti
 		return hostRuntimeConfig{}, fmt.Errorf("runtime CWD is not a directory: %s", cwd)
 	}
 
-	if option.FileSystem.Root == "" {
-		option.FileSystem.Root = cwd
-	}
-	option.FileSystem.Root, err = filepath.Abs(option.FileSystem.Root)
-	if err != nil {
-		return hostRuntimeConfig{}, fmt.Errorf("resolve filesystem root: %w", err)
+	if len(option.FileSystem.Mounts) == 0 {
+		if option.FileSystem.VirtualCWD != "" {
+			return hostRuntimeConfig{}, errors.New("filesystem VirtualCWD requires multi-mount mode")
+		}
+		if option.FileSystem.Root == "" {
+			option.FileSystem.Root = cwd
+		}
+		option.FileSystem.Root, err = filepath.Abs(option.FileSystem.Root)
+		if err != nil {
+			return hostRuntimeConfig{}, fmt.Errorf("resolve filesystem root: %w", err)
+		}
+	} else {
+		if option.FileSystem.Mode != FileSystemSandbox {
+			return hostRuntimeConfig{}, errors.New("filesystem mounts require sandbox mode")
+		}
+		if option.FileSystem.Root != "" {
+			return hostRuntimeConfig{}, errors.New("filesystem Root and Mounts cannot be used together")
+		}
+		option.FileSystem.Mounts = append([]FileSystemMount(nil), option.FileSystem.Mounts...)
 	}
 
 	env := cloneStringMap(option.Env)
@@ -620,10 +646,9 @@ func (s *hostRuntimeState) currentCWD() string {
 	return s.config.cwd
 }
 
-func (s *hostRuntimeState) resolvePath(name string) (string, error) {
+func (s *hostRuntimeState) resolveHostPath(name string, writable bool) (string, error) {
 	if s.fsys != nil {
-		_, full, err := s.fsys.resolve(name)
-		return full, err
+		return s.fsys.resolveHostPath(name, writable)
 	}
 	return s.resolvePathFrom(s.currentCWD(), name)
 }
@@ -669,7 +694,7 @@ func (s *hostRuntimeState) chdir(path string) (string, error) {
 	if s.fsys != nil {
 		return s.fsys.chdir(path)
 	}
-	next, err := s.resolvePath(path)
+	next, err := s.resolveHostPath(path, false)
 	if err != nil {
 		return "", err
 	}
@@ -822,7 +847,12 @@ func (s *hostRuntimeState) newExecFileRequest(this *This) (execFileRequest, erro
 
 	cwd := s.currentCWD()
 	if argCWD := strings.TrimSpace(args[2].String()); argCWD != "" {
-		cwd, err = s.resolvePath(argCWD)
+		cwd, err = s.resolveHostPath(argCWD, false)
+		if err != nil {
+			return execFileRequest{}, err
+		}
+	} else if s.fsys != nil && s.fsys.multi {
+		cwd, err = s.resolveHostPath(cwd, false)
 		if err != nil {
 			return execFileRequest{}, err
 		}

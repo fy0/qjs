@@ -8,7 +8,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -17,17 +19,74 @@ import (
 
 var errSandboxUnsupported = errors.New("operation is not supported in sandbox filesystem mode")
 
+type hostCodedError struct {
+	code    string
+	errno   int64
+	message string
+}
+
+func (e *hostCodedError) Error() string { return e.message }
+
+func newHostCodedError(code string, errno int64, message string) error {
+	return &hostCodedError{code: code, errno: errno, message: message}
+}
+
+func errReadOnly(name string) error {
+	return newHostCodedError("EROFS", -30, fmt.Sprintf("read-only filesystem: %s", name))
+}
+
+func errCrossDevice(source, dest string) error {
+	return newHostCodedError("EXDEV", -18, fmt.Sprintf("cross-device link not permitted: %s -> %s", source, dest))
+}
+
+func errBusy(name string) error {
+	return newHostCodedError("EBUSY", -16, fmt.Sprintf("resource busy or locked: %s", name))
+}
+
+func errIsDirectory(name string) error {
+	return newHostCodedError("EISDIR", -21, fmt.Sprintf("illegal operation on a directory: %s", name))
+}
+
+func errBadFileDescriptor(fd int64) error {
+	return newHostCodedError("EBADF", -9, fmt.Sprintf("bad file descriptor: %d", fd))
+}
+
+type hostFSMount struct {
+	path     string
+	name     string
+	rootPath string
+	root     *os.Root
+	readOnly bool
+}
+
+type hostFSPath struct {
+	mount         *hostFSMount
+	relative      string
+	virtual       string
+	host          string
+	syntheticRoot bool
+}
+
+type hostFileHandle struct {
+	file     *os.File
+	mount    *hostFSMount
+	writable bool
+}
+
 type hostFileSystem struct {
 	mode     FileSystemMode
 	rootPath string
 	root     *os.Root
+	multi    bool
+	mounts   []hostFSMount
+	mountMap map[string]*hostFSMount
 
 	cwdMu sync.RWMutex
 	cwd   string
 
 	handlesMu sync.Mutex
 	nextFD    int64
-	handles   map[int64]*os.File
+	handles   map[int64]hostFileHandle
 	closeOnce sync.Once
 }
 
@@ -51,6 +110,9 @@ func newHostFileSystem(options FileSystemOptions, cwd string) (*hostFileSystem, 
 	if options.Mode != FileSystemSandbox && options.Mode != FileSystemHost {
 		return nil, fmt.Errorf("invalid filesystem mode %d", options.Mode)
 	}
+	if len(options.Mounts) > 0 {
+		return newMultiMountHostFileSystem(options)
+	}
 
 	rootPath, err := filepath.Abs(options.Root)
 	if err != nil {
@@ -66,7 +128,7 @@ func newHostFileSystem(options FileSystemOptions, cwd string) (*hostFileSystem, 
 		rootPath: rootPath,
 		cwd:      cwd,
 		nextFD:   2,
-		handles:  make(map[int64]*os.File),
+		handles:  make(map[int64]hostFileHandle),
 	}
 	if options.Mode == FileSystemSandbox {
 		if _, err := pathWithinRoot(rootPath, cwd); err != nil {
@@ -81,17 +143,138 @@ func newHostFileSystem(options FileSystemOptions, cwd string) (*hostFileSystem, 
 	return h, nil
 }
 
+func newMultiMountHostFileSystem(options FileSystemOptions) (_ *hostFileSystem, err error) {
+	if options.Mode != FileSystemSandbox {
+		return nil, errors.New("filesystem mounts require sandbox mode")
+	}
+	if options.Root != "" {
+		return nil, errors.New("filesystem Root and Mounts cannot be used together")
+	}
+
+	h := &hostFileSystem{
+		mode:     FileSystemSandbox,
+		multi:    true,
+		mounts:   make([]hostFSMount, 0, len(options.Mounts)),
+		mountMap: make(map[string]*hostFSMount, len(options.Mounts)),
+		nextFD:   2,
+		handles:  make(map[int64]hostFileHandle),
+	}
+	defer func() {
+		if err != nil {
+			h.close()
+		}
+	}()
+
+	for index, option := range options.Mounts {
+		if err := validateMountPath(option.Path); err != nil {
+			return nil, fmt.Errorf("filesystem mount %d: %w", index, err)
+		}
+		if _, exists := h.mountMap[option.Path]; exists {
+			return nil, fmt.Errorf("duplicate filesystem mount path %q", option.Path)
+		}
+		if option.Root == "" {
+			return nil, fmt.Errorf("filesystem mount %q requires a physical Root", option.Path)
+		}
+
+		rootPath, err := filepath.Abs(option.Root)
+		if err != nil {
+			return nil, fmt.Errorf("resolve filesystem mount %q root: %w", option.Path, err)
+		}
+		rootPath, err = filepath.EvalSymlinks(rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve filesystem mount %q root symlinks: %w", option.Path, err)
+		}
+		info, err := os.Stat(rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("stat filesystem mount %q root: %w", option.Path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("filesystem mount %q root is not a directory: %s", option.Path, rootPath)
+		}
+		for _, existing := range h.mounts {
+			if physicalPathsOverlap(existing.rootPath, rootPath) {
+				return nil, fmt.Errorf("filesystem mount roots overlap: %q and %q", existing.path, option.Path)
+			}
+		}
+		root, err := os.OpenRoot(rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("open filesystem mount %q root: %w", option.Path, err)
+		}
+		h.mounts = append(h.mounts, hostFSMount{
+			path:     option.Path,
+			name:     strings.TrimPrefix(option.Path, "/"),
+			rootPath: rootPath,
+			root:     root,
+			readOnly: option.ReadOnly,
+		})
+		h.mountMap[option.Path] = &h.mounts[len(h.mounts)-1]
+	}
+
+	sort.Slice(h.mounts, func(i, j int) bool { return h.mounts[i].path < h.mounts[j].path })
+	for index := range h.mounts {
+		h.mountMap[h.mounts[index].path] = &h.mounts[index]
+	}
+
+	h.cwd = options.VirtualCWD
+	if h.cwd == "" {
+		h.cwd = "/"
+	}
+	resolved, err := h.resolveVirtual(h.cwd)
+	if err != nil {
+		return nil, fmt.Errorf("invalid filesystem VirtualCWD %q: %w", h.cwd, err)
+	}
+	if !resolved.syntheticRoot {
+		info, statErr := resolved.mount.root.Stat(resolved.relative)
+		if statErr != nil {
+			return nil, fmt.Errorf("stat filesystem VirtualCWD %q: %w", h.cwd, statErr)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("filesystem VirtualCWD is not a directory: %s", h.cwd)
+		}
+	}
+	h.cwd = resolved.virtual
+	return h, nil
+}
+
+func validateMountPath(name string) error {
+	if name == "" || strings.ContainsRune(name, '\x00') || strings.Contains(name, `\`) {
+		return fmt.Errorf("invalid virtual mount path %q", name)
+	}
+	if name == "/" || !strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || pathpkg.Clean(name) != name {
+		return fmt.Errorf("virtual mount path must be a normalized top-level absolute path: %q", name)
+	}
+	part := strings.TrimPrefix(name, "/")
+	if part == "" || part == "." || part == ".." || strings.Contains(part, "/") {
+		return fmt.Errorf("virtual mount path must be a normalized top-level absolute path: %q", name)
+	}
+	return nil
+}
+
+func physicalPathsOverlap(left, right string) bool {
+	leftToRight, leftErr := filepath.Rel(left, right)
+	rightToLeft, rightErr := filepath.Rel(right, left)
+	isWithin := func(rel string, err error) bool {
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+	}
+	return isWithin(leftToRight, leftErr) || isWithin(rightToLeft, rightErr)
+}
+
 func (h *hostFileSystem) close() {
 	h.closeOnce.Do(func() {
 		h.handlesMu.Lock()
 		handles := h.handles
-		h.handles = make(map[int64]*os.File)
+		h.handles = make(map[int64]hostFileHandle)
 		h.handlesMu.Unlock()
-		for _, file := range handles {
-			_ = file.Close()
+		for _, handle := range handles {
+			_ = handle.file.Close()
 		}
 		if h.root != nil {
 			_ = h.root.Close()
+		}
+		for index := range h.mounts {
+			if h.mounts[index].root != nil {
+				_ = h.mounts[index].root.Close()
+			}
 		}
 	})
 }
@@ -103,6 +286,16 @@ func (h *hostFileSystem) currentCWD() string {
 }
 
 func (h *hostFileSystem) resolve(name string) (relative, full string, err error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return "", "", err
+		}
+		if resolved.syntheticRoot {
+			return ".", "", nil
+		}
+		return resolved.relative, resolved.host, nil
+	}
 	if strings.TrimSpace(name) == "" {
 		return "", "", errors.New("path is required")
 	}
@@ -128,6 +321,94 @@ func (h *hostFileSystem) resolve(name string) (relative, full string, err error)
 	return relative, full, nil
 }
 
+func (h *hostFileSystem) resolveVirtual(name string) (*hostFSPath, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, errors.New("path is required")
+	}
+	if strings.ContainsRune(name, '\x00') {
+		return nil, os.ErrInvalid
+	}
+	if runtime.GOOS == "windows" {
+		name = strings.ReplaceAll(name, `\`, "/")
+	}
+	var virtual string
+	if strings.HasPrefix(name, "/") {
+		virtual = pathpkg.Clean(name)
+	} else {
+		virtual = pathpkg.Clean(pathpkg.Join(h.currentCWD(), name))
+	}
+	if virtual == "." {
+		virtual = "/"
+	}
+	if !strings.HasPrefix(virtual, "/") {
+		virtual = "/" + virtual
+	}
+	if virtual == "/" {
+		return &hostFSPath{virtual: "/", syntheticRoot: true}, nil
+	}
+
+	first := strings.SplitN(strings.TrimPrefix(virtual, "/"), "/", 2)[0]
+	mount := h.mountMap["/"+first]
+	if mount == nil {
+		return nil, fmt.Errorf("%w: %s", os.ErrNotExist, virtual)
+	}
+	relative := strings.TrimPrefix(virtual, mount.path)
+	relative = strings.TrimPrefix(relative, "/")
+	if relative == "" {
+		relative = "."
+	}
+	return &hostFSPath{
+		mount:    mount,
+		relative: filepath.FromSlash(relative),
+		virtual:  virtual,
+		host:     filepath.Join(mount.rootPath, filepath.FromSlash(relative)),
+	}, nil
+}
+
+func (h *hostFileSystem) resolveHostPath(name string, writable bool) (string, error) {
+	if !h.multi {
+		_, full, err := h.resolve(name)
+		return full, err
+	}
+	resolved, err := h.resolveVirtual(name)
+	if err != nil {
+		return "", err
+	}
+	if resolved.syntheticRoot {
+		return "", errors.New("synthetic filesystem root has no host path")
+	}
+	if writable && resolved.mount.readOnly {
+		return "", errReadOnly(resolved.virtual)
+	}
+	if writable && resolved.relative == "." {
+		return "", errIsDirectory(resolved.virtual)
+	}
+
+	checkPath := resolved.host
+	if writable {
+		checkPath = filepath.Dir(checkPath)
+	}
+	checkedPath, err := filepath.EvalSymlinks(checkPath)
+	if err != nil {
+		return "", virtualizePathError(err, resolved.virtual)
+	}
+	if _, err := pathWithinRoot(resolved.mount.rootPath, checkedPath); err != nil {
+		return "", fmt.Errorf("path %q escapes filesystem mount %q", resolved.virtual, resolved.mount.path)
+	}
+	if writable {
+		return filepath.Join(checkedPath, filepath.Base(resolved.host)), nil
+	}
+	return checkedPath, nil
+}
+
+func virtualizePathError(err error, virtualPath string) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return &os.PathError{Op: pathErr.Op, Path: virtualPath, Err: pathErr.Err}
+	}
+	return err
+}
+
 func pathWithinRoot(root, name string) (string, error) {
 	rel, err := filepath.Rel(root, name)
 	if err != nil {
@@ -143,6 +424,16 @@ func pathWithinRoot(root, name string) (string, error) {
 }
 
 func (h *hostFileSystem) open(name string) (*os.File, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return nil, err
+		}
+		if resolved.syntheticRoot {
+			return nil, errIsDirectory(resolved.virtual)
+		}
+		return resolved.mount.root.Open(resolved.relative)
+	}
 	rel, full, err := h.resolve(name)
 	if err != nil {
 		return nil, err
@@ -154,17 +445,64 @@ func (h *hostFileSystem) open(name string) (*os.File, error) {
 }
 
 func (h *hostFileSystem) openFile(name string, flag int, perm fs.FileMode) (*os.File, error) {
+	file, _, err := h.openFileWithMount(name, flag, perm)
+	return file, err
+}
+
+func (h *hostFileSystem) openFileWithMount(name string, flag int, perm fs.FileMode) (*os.File, *hostFSMount, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if resolved.syntheticRoot || resolved.relative == "." && isWritableOpenFlag(flag) {
+			return nil, nil, errIsDirectory(resolved.virtual)
+		}
+		if isWritableOpenFlag(flag) && resolved.mount.readOnly {
+			return nil, nil, errReadOnly(resolved.virtual)
+		}
+		file, err := resolved.mount.root.OpenFile(resolved.relative, flag, perm)
+		return file, resolved.mount, err
+	}
 	rel, full, err := h.resolve(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if h.mode == FileSystemSandbox {
-		return h.root.OpenFile(rel, flag, perm)
+		file, err := h.root.OpenFile(rel, flag, perm)
+		return file, nil, err
 	}
-	return os.OpenFile(full, flag, perm)
+	file, err := os.OpenFile(full, flag, perm)
+	return file, nil, err
+}
+
+func isWritableOpenFlag(flag int) bool {
+	return flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0
 }
 
 func (h *hostFileSystem) readFile(name string) ([]byte, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return nil, err
+		}
+		if resolved.syntheticRoot {
+			return nil, errIsDirectory(resolved.virtual)
+		}
+		info, err := resolved.mount.root.Stat(resolved.relative)
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			return nil, errIsDirectory(resolved.virtual)
+		}
+		file, err := resolved.mount.root.Open(resolved.relative)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		return io.ReadAll(file)
+	}
 	file, err := h.open(name)
 	if err != nil {
 		return nil, err
@@ -218,6 +556,25 @@ func parseNodeOpenFlag(flag string) (int, error) {
 }
 
 func (h *hostFileSystem) mkdir(name string, recursive bool, mode fs.FileMode) error {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return err
+		}
+		if resolved.syntheticRoot {
+			if recursive {
+				return nil
+			}
+			return os.ErrExist
+		}
+		if resolved.mount.readOnly {
+			return errReadOnly(resolved.virtual)
+		}
+		if recursive {
+			return resolved.mount.root.MkdirAll(resolved.relative, mode)
+		}
+		return resolved.mount.root.Mkdir(resolved.relative, mode)
+	}
 	rel, full, err := h.resolve(name)
 	if err != nil {
 		return err
@@ -255,11 +612,46 @@ func (h *hostFileSystem) mkdir(name string, recursive bool, mode fs.FileMode) er
 }
 
 func (h *hostFileSystem) readDir(name string, withFileTypes bool) (any, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return nil, err
+		}
+		if resolved.syntheticRoot {
+			if !withFileTypes {
+				names := make([]string, 0, len(h.mounts))
+				for index := range h.mounts {
+					names = append(names, h.mounts[index].name)
+				}
+				return names, nil
+			}
+			entries := make([]map[string]any, 0, len(h.mounts))
+			for index := range h.mounts {
+				entries = append(entries, map[string]any{
+					"name":           h.mounts[index].name,
+					"isFile":         false,
+					"isDirectory":    true,
+					"isSymbolicLink": false,
+				})
+			}
+			return entries, nil
+		}
+		file, err := resolved.mount.root.Open(resolved.relative)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		return readDirEntries(file, withFileTypes)
+	}
 	file, err := h.open(name)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+	return readDirEntries(file, withFileTypes)
+}
+
+func readDirEntries(file *os.File, withFileTypes bool) (any, error) {
 	entries, err := file.ReadDir(-1)
 	if err != nil {
 		return nil, err
@@ -286,6 +678,29 @@ func (h *hostFileSystem) readDir(name string, withFileTypes bool) (any, error) {
 }
 
 func (h *hostFileSystem) stat(name string, lstat bool) (map[string]any, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return nil, err
+		}
+		if resolved.syntheticRoot {
+			return hostDirectoryInfoPayload("/"), nil
+		}
+		var info os.FileInfo
+		if lstat {
+			info, err = resolved.mount.root.Lstat(resolved.relative)
+		} else {
+			info, err = resolved.mount.root.Stat(resolved.relative)
+		}
+		if err != nil {
+			return nil, err
+		}
+		payload := hostFileInfoPayload(info)
+		if resolved.relative == "." {
+			payload["name"] = resolved.mount.name
+		}
+		return payload, nil
+	}
 	rel, full, err := h.resolve(name)
 	if err != nil {
 		return nil, err
@@ -306,6 +721,25 @@ func (h *hostFileSystem) stat(name string, lstat bool) (map[string]any, error) {
 		return nil, err
 	}
 	return hostFileInfoPayload(info), nil
+}
+
+func hostDirectoryInfoPayload(name string) map[string]any {
+	return map[string]any{
+		"name":              name,
+		"size":              int64(0),
+		"mode":              uint32(fs.ModeDir | 0o555),
+		"mtimeMs":           int64(0),
+		"atimeMs":           int64(0),
+		"ctimeMs":           int64(0),
+		"birthtimeMs":       int64(0),
+		"isFile":            false,
+		"isDirectory":       true,
+		"isSymbolicLink":    false,
+		"isBlockDevice":     false,
+		"isCharacterDevice": false,
+		"isFIFO":            false,
+		"isSocket":          false,
+	}
 }
 
 func hostFileInfoPayload(info os.FileInfo) map[string]any {
@@ -330,6 +764,30 @@ func hostFileInfoPayload(info os.FileInfo) map[string]any {
 }
 
 func (h *hostFileSystem) remove(name string, recursive, force bool) error {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			if force && errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if resolved.syntheticRoot || resolved.relative == "." {
+			return errBusy(resolved.virtual)
+		}
+		if resolved.mount.readOnly {
+			return errReadOnly(resolved.virtual)
+		}
+		if recursive {
+			err = removeSandboxTree(resolved.mount.root, resolved.relative)
+		} else {
+			err = resolved.mount.root.Remove(resolved.relative)
+		}
+		if force && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
 	rel, full, err := h.resolve(name)
 	if err != nil {
 		return err
@@ -360,14 +818,18 @@ func (h *hostFileSystem) remove(name string, recursive, force bool) error {
 }
 
 func (h *hostFileSystem) removeSandboxTree(rel string) error {
-	info, err := h.root.Lstat(rel)
+	return removeSandboxTree(h.root, rel)
+}
+
+func removeSandboxTree(root *os.Root, rel string) error {
+	info, err := root.Lstat(rel)
 	if err != nil {
 		return err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return h.root.Remove(rel)
+		return root.Remove(rel)
 	}
-	file, err := h.root.Open(rel)
+	file, err := root.Open(rel)
 	if err != nil {
 		return err
 	}
@@ -377,14 +839,35 @@ func (h *hostFileSystem) removeSandboxTree(rel string) error {
 		return readErr
 	}
 	for _, entry := range entries {
-		if err := h.removeSandboxTree(filepath.Join(rel, entry.Name())); err != nil {
+		if err := removeSandboxTree(root, filepath.Join(rel, entry.Name())); err != nil {
 			return err
 		}
 	}
-	return h.root.Remove(rel)
+	return root.Remove(rel)
 }
 
 func (h *hostFileSystem) realPath(name string) (string, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return "", err
+		}
+		if resolved.syntheticRoot {
+			return "/", nil
+		}
+		physical, err := filepath.EvalSymlinks(resolved.host)
+		if err != nil {
+			return "", err
+		}
+		relative, err := pathWithinRoot(resolved.mount.rootPath, physical)
+		if err != nil {
+			return "", err
+		}
+		if relative == "." {
+			return resolved.mount.path, nil
+		}
+		return pathpkg.Join(resolved.mount.path, filepath.ToSlash(relative)), nil
+	}
 	_, full, err := h.resolve(name)
 	if err != nil {
 		return "", err
@@ -420,6 +903,32 @@ func (h *hostFileSystem) copyFile(source, dest string, mode fs.FileMode) error {
 }
 
 func (h *hostFileSystem) rename(source, dest string) error {
+	if h.multi {
+		sourcePath, err := h.resolveVirtual(source)
+		if err != nil {
+			return err
+		}
+		destPath, err := h.resolveVirtual(dest)
+		if err != nil {
+			return err
+		}
+		if sourcePath.syntheticRoot || sourcePath.relative == "." {
+			return errBusy(sourcePath.virtual)
+		}
+		if destPath.syntheticRoot || destPath.relative == "." {
+			return errBusy(destPath.virtual)
+		}
+		if sourcePath.mount != destPath.mount {
+			return errCrossDevice(sourcePath.virtual, destPath.virtual)
+		}
+		if sourcePath.mount.readOnly {
+			return errReadOnly(sourcePath.virtual)
+		}
+		if destPath.mount.readOnly {
+			return errReadOnly(destPath.virtual)
+		}
+		return sourcePath.mount.root.Rename(sourcePath.relative, destPath.relative)
+	}
 	if h.mode == FileSystemSandbox {
 		return errSandboxUnsupported
 	}
@@ -435,6 +944,25 @@ func (h *hostFileSystem) rename(source, dest string) error {
 }
 
 func (h *hostFileSystem) chdir(name string) (string, error) {
+	if h.multi {
+		resolved, err := h.resolveVirtual(name)
+		if err != nil {
+			return "", err
+		}
+		if !resolved.syntheticRoot {
+			info, err := resolved.mount.root.Stat(resolved.relative)
+			if err != nil {
+				return "", err
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("not a directory: %s", name)
+			}
+		}
+		h.cwdMu.Lock()
+		h.cwd = resolved.virtual
+		h.cwdMu.Unlock()
+		return resolved.virtual, nil
+	}
 	_, full, err := h.resolve(name)
 	if err != nil {
 		return "", err
@@ -452,34 +980,34 @@ func (h *hostFileSystem) chdir(name string) (string, error) {
 	return full, nil
 }
 
-func (h *hostFileSystem) addHandle(file *os.File) int64 {
+func (h *hostFileSystem) addHandle(file *os.File, mount *hostFSMount, writable bool) int64 {
 	h.handlesMu.Lock()
 	defer h.handlesMu.Unlock()
 	h.nextFD++
 	fd := h.nextFD
-	h.handles[fd] = file
+	h.handles[fd] = hostFileHandle{file: file, mount: mount, writable: writable}
 	return fd
 }
 
-func (h *hostFileSystem) handle(fd int64) (*os.File, error) {
+func (h *hostFileSystem) handle(fd int64) (hostFileHandle, error) {
 	h.handlesMu.Lock()
 	defer h.handlesMu.Unlock()
-	file := h.handles[fd]
-	if file == nil {
-		return nil, fmt.Errorf("bad file descriptor: %d", fd)
+	handle, ok := h.handles[fd]
+	if !ok {
+		return hostFileHandle{}, errBadFileDescriptor(fd)
 	}
-	return file, nil
+	return handle, nil
 }
 
 func (h *hostFileSystem) closeHandle(fd int64) error {
 	h.handlesMu.Lock()
-	file := h.handles[fd]
+	handle, ok := h.handles[fd]
 	delete(h.handles, fd)
 	h.handlesMu.Unlock()
-	if file == nil {
-		return fmt.Errorf("bad file descriptor: %d", fd)
+	if !ok {
+		return errBadFileDescriptor(fd)
 	}
-	return file.Close()
+	return handle.file.Close()
 }
 
 func (s *hostRuntimeState) hostFSSync(this *This) (*Value, error) {
@@ -530,7 +1058,7 @@ func (s *hostRuntimeState) hostFSAsyncStart(this *This) (*Value, error) {
 		}
 		result, err := s.runHostFSOperation(op, name, options, data)
 		if err != nil {
-			return nil, &os.PathError{Op: op, Path: name, Err: err}
+			return nil, &hostOperationError{Err: err, Op: op, Path: name, Dest: options.Dest}
 		}
 		return result, ctx.Err()
 	})
@@ -589,10 +1117,7 @@ func (s *hostRuntimeState) runHostFSOperation(op, name string, options hostFSOpt
 		}
 		return nil, err
 	case "access":
-		file, err := s.fsys.open(name)
-		if err == nil {
-			err = file.Close()
-		}
+		_, err := s.fsys.stat(name, false)
 		return nil, err
 	case "realpath":
 		return s.fsys.realPath(name)
@@ -611,31 +1136,47 @@ func (s *hostRuntimeState) runHostFSOperation(op, name string, options hostFSOpt
 		if err != nil {
 			return nil, err
 		}
-		file, err := s.fsys.openFile(name, openFlag, fileMode)
+		file, mount, err := s.fsys.openFileWithMount(name, openFlag, fileMode)
 		if err != nil {
 			return nil, err
 		}
-		return s.fsys.addHandle(file), nil
+		return s.fsys.addHandle(file, mount, isWritableOpenFlag(openFlag)), nil
 	case "writeFD":
-		file, err := s.fsys.handle(options.FD)
+		handle, err := s.fsys.handle(options.FD)
 		if err != nil {
 			return nil, err
+		}
+		if !handle.writable {
+			return nil, errBadFileDescriptor(options.FD)
 		}
 		if options.HasPosition {
-			n, err := file.WriteAt(data, options.Position)
+			n, err := handle.file.WriteAt(data, options.Position)
 			return n, err
 		}
-		n, err := file.Write(data)
+		n, err := handle.file.Write(data)
 		return n, err
 	case "closeFD":
 		return nil, s.fsys.closeHandle(options.FD)
 	case "syncFD":
-		file, err := s.fsys.handle(options.FD)
+		handle, err := s.fsys.handle(options.FD)
 		if err != nil {
 			return nil, err
 		}
-		return nil, file.Sync()
+		return nil, handle.file.Sync()
 	case "utimes":
+		if s.fsys.multi {
+			resolved, err := s.fsys.resolveVirtual(name)
+			if err != nil {
+				return nil, err
+			}
+			if resolved.syntheticRoot {
+				return nil, errReadOnly(resolved.virtual)
+			}
+			if resolved.mount.readOnly {
+				return nil, errReadOnly(resolved.virtual)
+			}
+			return nil, resolved.mount.root.Chtimes(resolved.relative, time.UnixMilli(options.AtimeMS), time.UnixMilli(options.MtimeMS))
+		}
 		if s.fsys.mode == FileSystemSandbox {
 			return nil, errSandboxUnsupported
 		}

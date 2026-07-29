@@ -480,7 +480,8 @@ func (s *hostRuntimeState) unixListen(this *This) (*Value, error) {
 		return nil, errors.New("unix listen requires a path")
 	}
 
-	path, err := s.resolvePath(args[0].String())
+	requestedPath := args[0].String()
+	path, err := s.resolveHostPath(requestedPath, true)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +499,7 @@ func (s *hostRuntimeState) unixListen(this *This) (*Value, error) {
 
 	return ToJsValue(this.Context(), map[string]any{
 		"id":   id,
-		"path": path,
+		"path": requestedPath,
 	})
 }
 
@@ -512,7 +513,8 @@ func (s *hostRuntimeState) unixConnect(this *This) (*Value, error) {
 		return nil, errors.New("unix connect requires a path")
 	}
 
-	path, err := s.resolvePath(args[0].String())
+	requestedPath := args[0].String()
+	path, err := s.resolveHostPath(requestedPath, false)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +528,7 @@ func (s *hostRuntimeState) unixConnect(this *This) (*Value, error) {
 
 	return ToJsValue(this.Context(), map[string]any{
 		"id":   id,
-		"path": path,
+		"path": requestedPath,
 	})
 }
 

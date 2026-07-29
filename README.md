@@ -330,6 +330,24 @@ err := rt.InstallHostRuntime(qjs.HostRuntimeOptions{
 
 In host mode, relative paths use `CWD` and absolute paths are unrestricted; `FileSystem.Root` is not a host-mode boundary.
 
+For runtimes that need several independent host directories, sandbox mode also supports a static virtual mount table. Each mount path must be a normalized, case-sensitive, top-level POSIX path such as `/assets` or `/data`:
+
+```go
+err := rt.InstallHostRuntime(qjs.HostRuntimeOptions{
+	FileSystem: qjs.FileSystemOptions{
+		Mounts: []qjs.FileSystemMount{
+			{Path: "/assets", Root: "/srv/app/assets", ReadOnly: true},
+			{Path: "/data", Root: "/srv/app/data"},
+		},
+		VirtualCWD: "/data",
+	},
+})
+```
+
+When `Mounts` is non-empty, `Root` must be empty and `Mode` must be `FileSystemSandbox`. `VirtualCWD` defaults to the synthetic root `/`; it may also name a mount root or an existing directory inside a mount. The synthetic root is read-only, and its directory entries are the sorted mount names. Paths outside the configured mounts return `ENOENT` and never fall back to the host or runtime CWD.
+
+Read-only mounts reject all mutations with `EROFS`. Files may be copied from a read-only mount into a writable mount, while cross-mount rename returns `EXDEV`; mount roots cannot be removed or renamed. `process.cwd()`, `process.chdir()`, and `realpath` remain in the virtual namespace. Workers inherit a copy of the mount configuration and open independent roots and file descriptors. Child processes require a working directory inside a physical mount when the virtual CWD is `/`.
+
 Both promise, callback, and common synchronous filesystem forms are available. Errors expose Node-style fields such as `code`, `errno`, `syscall`, and `path`.
 
 ```js
