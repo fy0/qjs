@@ -495,6 +495,10 @@ func TestHostRuntimeMultiMountHostPathConsumers(t *testing.T) {
 	data := t.TempDir()
 	work := filepath.Join(data, "work")
 	require.NoError(t, os.Mkdir(work, 0o700))
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(data, "outside")); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
 	shell, err := exec.LookPath("sh")
 	require.NoError(t, err)
 	shellJSON := string(must(json.Marshal(shell)))
@@ -520,10 +524,24 @@ func TestHostRuntimeMultiMountHostPathConsumers(t *testing.T) {
 			let readOnlySocketError = "";
 			try { new PipeServerSocket("/assets/blocked.sock"); }
 			catch (error) { readOnlySocketError = String(error); }
+			let symlinkSocketError = "";
+			try { new PipeServerSocket("/data/outside/blocked.sock"); }
+			catch (error) { symlinkSocketError = String(error); }
+			let symlinkExecError = "";
+			try { process.execFileSync(`+shellJSON+`, `+argsJSON+`, { cwd: "/data/outside" }); }
+			catch (error) { symlinkExecError = String(error); }
 			const server = new PipeServerSocket("/data/runtime.sock");
 			const socketPath = server.path;
 			server.close();
-			return JSON.stringify({ before, after: process.cwd(), stdout: executed.stdout, readOnlySocketError, socketPath });
+			return JSON.stringify({
+				before,
+				after: process.cwd(),
+				stdout: executed.stdout,
+				readOnlySocketError,
+				symlinkSocketError,
+				symlinkExecError,
+				socketPath
+			});
 		})();
 	`), qjs.TypeModule())
 	require.NoError(t, err)
@@ -534,6 +552,8 @@ func TestHostRuntimeMultiMountHostPathConsumers(t *testing.T) {
 		After               string `json:"after"`
 		Stdout              string `json:"stdout"`
 		ReadOnlySocketError string `json:"readOnlySocketError"`
+		SymlinkSocketError  string `json:"symlinkSocketError"`
+		SymlinkExecError    string `json:"symlinkExecError"`
 		SocketPath          string `json:"socketPath"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(result.String()), &got))
@@ -541,6 +561,11 @@ func TestHostRuntimeMultiMountHostPathConsumers(t *testing.T) {
 	require.Equal(t, "/data", got.After)
 	require.Equal(t, work, strings.TrimSpace(got.Stdout))
 	require.Contains(t, got.ReadOnlySocketError, "read-only filesystem")
+	require.Contains(t, got.SymlinkSocketError, "escapes filesystem mount")
+	require.Contains(t, got.SymlinkExecError, "escapes filesystem mount")
+	require.NotContains(t, got.SymlinkSocketError, outside)
+	require.NotContains(t, got.SymlinkExecError, outside)
 	require.Equal(t, "/data/runtime.sock", got.SocketPath)
 	require.NoFileExists(t, filepath.Join(data, "runtime.sock"))
+	require.NoFileExists(t, filepath.Join(outside, "blocked.sock"))
 }

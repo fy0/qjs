@@ -380,7 +380,33 @@ func (h *hostFileSystem) resolveHostPath(name string, writable bool) (string, er
 	if writable && resolved.mount.readOnly {
 		return "", errReadOnly(resolved.virtual)
 	}
-	return resolved.host, nil
+	if writable && resolved.relative == "." {
+		return "", errIsDirectory(resolved.virtual)
+	}
+
+	checkPath := resolved.host
+	if writable {
+		checkPath = filepath.Dir(checkPath)
+	}
+	checkedPath, err := filepath.EvalSymlinks(checkPath)
+	if err != nil {
+		return "", virtualizePathError(err, resolved.virtual)
+	}
+	if _, err := pathWithinRoot(resolved.mount.rootPath, checkedPath); err != nil {
+		return "", fmt.Errorf("path %q escapes filesystem mount %q", resolved.virtual, resolved.mount.path)
+	}
+	if writable {
+		return filepath.Join(checkedPath, filepath.Base(resolved.host)), nil
+	}
+	return checkedPath, nil
+}
+
+func virtualizePathError(err error, virtualPath string) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return &os.PathError{Op: pathErr.Op, Path: virtualPath, Err: pathErr.Err}
+	}
+	return err
 }
 
 func pathWithinRoot(root, name string) (string, error) {
