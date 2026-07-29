@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -118,18 +117,16 @@ func (s *hostRuntimeState) workerCreate(this *This) (*Value, error) {
 	}
 
 	if !options.Eval {
-		path, err := s.resolvePath(sourceOrPath)
-		if err != nil {
-			return nil, err
-		}
-
-		data, err := os.ReadFile(path)
+		data, err := s.fsys.readFile(sourceOrPath)
 		if err != nil {
 			return nil, err
 		}
 
 		source = string(data)
-		filename = path
+		filename, err = s.fsys.realPath(sourceOrPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -137,7 +134,7 @@ func (s *hostRuntimeState) workerCreate(this *This) (*Value, error) {
 		source:         source,
 		filename:       filename,
 		module:         options.Type == "module",
-		config:         s.config,
+		config:         cloneHostRuntimeConfig(s.config),
 		cancel:         cancel,
 		parentToWorker: make(chan string, 64),
 		workerToParent: make(chan string, 64),
@@ -148,6 +145,13 @@ func (s *hostRuntimeState) workerCreate(this *This) (*Value, error) {
 	go worker.run(ctx)
 
 	return this.Context().NewInt64(id), nil
+}
+
+func cloneHostRuntimeConfig(config hostRuntimeConfig) hostRuntimeConfig {
+	config.args = append([]string(nil), config.args...)
+	config.env = cloneStringMap(config.env)
+	config.fs.Mounts = append([]FileSystemMount(nil), config.fs.Mounts...)
+	return config
 }
 
 func (s *hostRuntimeState) workerPost(this *This) (*Value, error) {

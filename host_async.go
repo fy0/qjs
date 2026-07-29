@@ -37,6 +37,16 @@ type hostErrorPayload struct {
 	Dest    string `json:"dest,omitempty"`
 }
 
+type hostOperationError struct {
+	Err  error
+	Op   string
+	Path string
+	Dest string
+}
+
+func (e *hostOperationError) Error() string { return e.Err.Error() }
+func (e *hostOperationError) Unwrap() error { return e.Err }
+
 func newHostAsyncManager(parent context.Context) *hostAsyncManager {
 	ctx, cancel := context.WithCancel(parent)
 	return &hostAsyncManager{
@@ -145,6 +155,19 @@ func makeHostError(err error, op, path, dest string) hostErrorPayload {
 		payload.Code = "ETIMEDOUT"
 		return payload
 	}
+	var operationErr *hostOperationError
+	if errors.As(err, &operationErr) {
+		if payload.Syscall == "" {
+			payload.Syscall = operationErr.Op
+		}
+		if payload.Path == "" {
+			payload.Path = operationErr.Path
+		}
+		if payload.Dest == "" {
+			payload.Dest = operationErr.Dest
+		}
+		err = operationErr.Err
+	}
 
 	var pathErr *os.PathError
 	if errors.As(err, &pathErr) {
@@ -168,6 +191,12 @@ func makeHostError(err error, op, path, dest string) hostErrorPayload {
 			payload.Dest = linkErr.New
 		}
 		err = linkErr.Err
+	}
+
+	var codedErr *hostCodedError
+	if errors.As(err, &codedErr) {
+		payload.Code = codedErr.code
+		payload.Errno = codedErr.errno
 	}
 
 	var errno syscall.Errno
