@@ -3,7 +3,7 @@ module github.com/fastschema/qjs
 go 1.24.0
 
 require (
-	github.com/andybalholm/brotli v1.2.1
+	github.com/andybalholm/brotli v1.2.3
 	github.com/stretchr/testify v1.11.1
 	github.com/tetratelabs/wazero v1.9.0
 	github.com/valyala/fasthttp v1.55.0
